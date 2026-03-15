@@ -81,6 +81,14 @@ async function noaaFetch(path, params = {}) {
   );
 }
 
+function tagRecords(records, sampleType, offsetKey, offsetValue) {
+  return (Array.isArray(records) ? records : []).map((r) => ({
+    ...r,
+    sampleType,
+    [offsetKey]: offsetValue,
+  }));
+}
+
 function toDateOnly(value) {
   return new Date(value).toISOString().slice(0, 10);
 }
@@ -285,6 +293,7 @@ export async function fetchClimateData({ locationName, lat, lon, eventEndTime })
     const sampleDay = toIsoDayUtc(d);
     if (!stationSupportsDate(station, sampleDay)) {
       recentSamples.push({
+        sampleType: 'recent',
         daysBack,
         date: sampleDay,
         records: [],
@@ -296,10 +305,16 @@ export async function fetchClimateData({ locationName, lat, lon, eventEndTime })
     try {
       log.debug(`NOAA /data recent sample request: ${toDateOnly(d)} (D-${daysBack})`);
       const sample = await fetchSingleDateSample(d);
-      recentSamples.push({ daysBack, ...sample });
+      recentSamples.push({
+        sampleType: 'recent',
+        daysBack,
+        ...sample,
+        records: tagRecords(sample.records, 'recent', 'daysBack', daysBack),
+      });
     } catch (err) {
       log.warn(`NOAA recent sample failed (${daysBack}d back): ${err.message}`);
       recentSamples.push({
+        sampleType: 'recent',
         daysBack,
         date: toDateOnly(d),
         records: [],
@@ -316,6 +331,7 @@ export async function fetchClimateData({ locationName, lat, lon, eventEndTime })
     const sampleDay = toIsoDayUtc(d);
     if (!stationSupportsDate(station, sampleDay)) {
       yearlyComparisons.push({
+        sampleType: 'yearly',
         yearsBack,
         date: sampleDay,
         records: [],
@@ -327,10 +343,16 @@ export async function fetchClimateData({ locationName, lat, lon, eventEndTime })
     try {
       log.debug(`NOAA /data yearly sample request: ${toDateOnly(d)} (${yearsBack}y ago)`);
       const sample = await fetchSingleDateSample(d);
-      yearlyComparisons.push({ yearsBack, ...sample });
+      yearlyComparisons.push({
+        sampleType: 'yearly',
+        yearsBack,
+        ...sample,
+        records: tagRecords(sample.records, 'yearly', 'yearsBack', yearsBack),
+      });
     } catch (err) {
       log.warn(`NOAA yearly sample failed (${yearsBack}y back): ${err.message}`);
       yearlyComparisons.push({
+        sampleType: 'yearly',
         yearsBack,
         date: toDateOnly(d),
         records: [],
@@ -356,7 +378,10 @@ export async function fetchClimateData({ locationName, lat, lon, eventEndTime })
       recentDaysBack,
       yearlyBack,
     },
-    records: recentSamples.flatMap((s) => s.records || []),
+    records: [
+      ...recentSamples.flatMap((s) => s.records || []),
+      ...yearlyComparisons.flatMap((s) => s.records || []),
+    ],
     recentSamples,
     yearlyComparisons,
   };
@@ -417,8 +442,10 @@ export function formatClimateDataForAI(data) {
   lines.push(`Event end reference: ${data.requestedWindow?.eventEndTime || '?'} | Target hour (UTC): ${data.requestedWindow?.targetHourUtc ?? '?'}`);
   lines.push(`Station: ${data.station?.id || 'unknown'} | ${data.station?.name || 'unknown'}`);
 
-  const recent = Array.isArray(data.recentSamples) ? data.recentSamples : [];
-  const yearly = Array.isArray(data.yearlyComparisons) ? data.yearlyComparisons : [];
+  const recent = (Array.isArray(data.recentSamples) ? data.recentSamples : [])
+    .filter((s) => (s?.sampleType || 'recent') === 'recent');
+  const yearly = (Array.isArray(data.yearlyComparisons) ? data.yearlyComparisons : [])
+    .filter((s) => (s?.sampleType || 'yearly') === 'yearly');
 
   if (recent.length === 0 && yearly.length === 0) {
     lines.push('No NOAA records returned (station or datatype coverage may be limited).');

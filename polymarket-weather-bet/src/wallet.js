@@ -19,7 +19,18 @@ function installAxiosInterceptors() {
   axios.interceptors.request.use((req) => req, (err) => Promise.reject(err));
   axios.interceptors.response.use((res) => res, (err) => {
     if (err.config?.url && err.config.url.includes('polymarket')) {
-      log.error(`HTTP ${err.response?.status || '?'} ${err.config.method?.toUpperCase()} ${err.config.url}`);
+      const status = err.response?.status;
+      const url = String(err.config.url || '');
+      const apiError = String(err.response?.data?.error || '');
+      const isExpectedNoOrderbook = status === 404
+        && url.includes('/price')
+        && apiError.toLowerCase().includes('no orderbook exists');
+
+      if (isExpectedNoOrderbook) {
+        log.debug(`HTTP ${status} ${err.config.method?.toUpperCase()} ${url} (${apiError})`);
+      } else {
+        log.error(`HTTP ${status || '?'} ${err.config.method?.toUpperCase()} ${url}`);
+      }
     }
     return Promise.reject(err);
   });

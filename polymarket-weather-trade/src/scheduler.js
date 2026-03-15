@@ -442,8 +442,10 @@ async function prepareEventData(event) {
           eventEndTime: event.endTime,
         });
 
-        const recentSamples = Array.isArray(climateData?.recentSamples) ? climateData.recentSamples : [];
-        const yearlySamples = Array.isArray(climateData?.yearlyComparisons) ? climateData.yearlyComparisons : [];
+        const recentSamples = (Array.isArray(climateData?.recentSamples) ? climateData.recentSamples : [])
+          .filter((s) => (s?.sampleType || 'recent') === 'recent');
+        const yearlySamples = (Array.isArray(climateData?.yearlyComparisons) ? climateData.yearlyComparisons : [])
+          .filter((s) => (s?.sampleType || 'yearly') === 'yearly');
         const recentUsable = recentSamples.reduce((sum, s) => sum + (Array.isArray(s?.records) ? s.records.length : 0), 0);
         const yearlyUsable = yearlySamples.reduce((sum, s) => sum + (Array.isArray(s?.records) ? s.records.length : 0), 0);
         const totalUsable = recentUsable + yearlyUsable;

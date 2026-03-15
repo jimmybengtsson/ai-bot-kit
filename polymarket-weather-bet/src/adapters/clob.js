@@ -78,8 +78,45 @@ export async function getYesAskPrice(tokenId, fallbackPrice = null) {
     const px = quote?.price ? parseFloat(quote.price) : null;
     return Number.isFinite(px) && px > 0 ? px : fallbackPrice;
   } catch (err) {
-    log.warn(`Failed ask quote for token ${tokenId.slice(0, 12)}: ${err.message}`);
+    const status = err?.response?.status;
+    const apiError = String(err?.response?.data?.error || err?.message || '');
+    const expectedNoOrderbook = status === 404 && apiError.toLowerCase().includes('no orderbook exists');
+    if (expectedNoOrderbook) {
+      log.debug(`No orderbook for token ${tokenId.slice(0, 12)} while fetching ask quote`);
+    } else {
+      log.warn(`Failed ask quote for token ${tokenId.slice(0, 12)}: ${err.message}`);
+    }
     return fallbackPrice;
+  }
+}
+
+export async function getAverageBuyPriceFromTrades(makerAddress, tokenId) {
+  if (!makerAddress || !tokenId) return null;
+
+  try {
+    const client = await getClobClient();
+    const trades = await retryWithBackoff(
+      () => client.getTrades({ maker_address: makerAddress, asset_id: tokenId }, true),
+      { maxRetries: 2, baseDelayMs: 1000, label: `trades ${String(tokenId).slice(0, 12)}`, shouldRetry: shouldRetryNetworkError },
+    );
+
+    let totalSize = 0;
+    let totalNotional = 0;
+    for (const t of (trades || [])) {
+      const side = String(t?.side || '').toUpperCase();
+      if (side !== 'BUY') continue;
+      const size = Number(t?.size);
+      const price = Number(t?.price);
+      if (!Number.isFinite(size) || size <= 0 || !Number.isFinite(price) || price <= 0) continue;
+      totalSize += size;
+      totalNotional += size * price;
+    }
+
+    if (totalSize <= 0) return null;
+    return totalNotional / totalSize;
+  } catch (err) {
+    log.debug(`Trade history buy-price fallback failed for token ${String(tokenId).slice(0, 12)}: ${err.message}`);
+    return null;
   }
 }
 

@@ -6,7 +6,7 @@ import { scanForTemperatureEvents } from './skills/eventScanner.js';
 import { fetchTemperatureForecastContext } from './skills/weatherFetcher.js';
 import { fetchClimateTemperatureContext } from './skills/climateFetcher.js';
 import { chooseTemperatureOutcome, validateTemperatureOutcome } from './ai.js';
-import { getOpenOrders, getPolymarketPositions, getYesAskPrice, placeYesOrder } from './adapters/clob.js';
+import { getAverageBuyPriceFromTrades, getOpenOrders, getPolymarketPositions, getYesAskPrice, placeYesOrder } from './adapters/clob.js';
 
 const log = createLogger('scheduler');
 
@@ -43,6 +43,43 @@ function toNum(...vals) {
     const n = Number(v);
     if (Number.isFinite(n)) return n;
   }
+  return null;
+}
+
+function inferBuyPriceFromPosition(position, size) {
+  const direct = toNum(
+    position?.avg_price,
+    position?.average_price,
+    position?.average_entry_price,
+    position?.entry_price,
+    position?.buy_price,
+    position?.buyPrice,
+    position?.initial_price,
+    position?.initialPrice,
+    position?.cost_basis,
+  );
+
+  if (direct != null) {
+    if (direct > 0 && direct <= 1) return direct;
+    if (size != null && size > 0) {
+      const normalized = direct / size;
+      if (Number.isFinite(normalized) && normalized > 0 && normalized <= 1) return normalized;
+    }
+  }
+
+  const totalValue = toNum(
+    position?.total_value,
+    position?.totalValue,
+    position?.position_value,
+    position?.positionValue,
+    position?.initial_value,
+    position?.initialValue,
+  );
+  if (totalValue != null && size != null && size > 0) {
+    const derived = totalValue / size;
+    if (Number.isFinite(derived) && derived > 0 && derived <= 1) return derived;
+  }
+
   return null;
 }
 
@@ -236,10 +273,18 @@ async function runPortfolioSnapshotJob(trigger = 'cron-5m') {
       getOpenOrders(account),
     ]);
 
+    const buyPriceByToken = new Map();
     const positionRows = [];
     for (const p of (positions || [])) {
       const tokenId = extractPosTokenId(p);
-      const buyPrice = toNum(p.avg_price, p.average_price, p.average_entry_price, p.entry_price, p.cost_basis);
+      const size = toNum(p.shares, p.size, p.position, p.balance, p.amount, p.quantity, p.total_shares);
+      let buyPrice = inferBuyPriceFromPosition(p, size);
+      if (buyPrice == null && tokenId) {
+        if (!buyPriceByToken.has(tokenId)) {
+          buyPriceByToken.set(tokenId, await getAverageBuyPriceFromTrades(account, tokenId));
+        }
+        buyPrice = buyPriceByToken.get(tokenId) ?? null;
+      }
       let currentPrice = toNum(p.current_price, p.mark_price, p.last_price, p.price, p.bid, p.ask);
       if (currentPrice == null && tokenId) {
         currentPrice = await getYesAskPrice(tokenId, null);
@@ -251,7 +296,7 @@ async function runPortfolioSnapshotJob(trigger = 'cron-5m') {
         market: String(p.title || p.market_title || p.event_title || p.question || 'unknown'),
         tokenId,
         side: String(p.side || p.outcome || ''),
-        size: toNum(p.shares, p.size, p.position, p.balance, p.amount, p.quantity, p.total_shares),
+        size,
         buyPrice,
         currentPrice,
         changePct,

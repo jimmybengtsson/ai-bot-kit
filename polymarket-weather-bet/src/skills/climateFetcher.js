@@ -138,6 +138,14 @@ async function fetchDailyTmax(stationId, dateObj) {
   return { day, tmax };
 }
 
+function withSampleType(sample, sampleType, offsetKey, offsetValue) {
+  return {
+    ...sample,
+    sampleType,
+    [offsetKey]: offsetValue,
+  };
+}
+
 async function chooseStationWithData(lat, lon, probeDates) {
   const ranked = await findNearestStations(lat, lon);
   if (ranked.length === 0) return null;
@@ -179,9 +187,9 @@ export async function fetchClimateTemperatureContext({ lat, lon, eventEndTime, s
   const recent = [];
   for (const d of recentDaysBack) {
     try {
-      recent.push(await fetchDailyTmax(station.id, shiftDays(searchTime, d)));
+      recent.push(withSampleType(await fetchDailyTmax(station.id, shiftDays(searchTime, d)), 'recent', 'daysBack', d));
     } catch {
-      recent.push({ day: toDateOnly(shiftDays(searchTime, d)), tmax: null });
+      recent.push(withSampleType({ day: toDateOnly(shiftDays(searchTime, d)), tmax: null }, 'recent', 'daysBack', d));
     }
     await sleep(NOAA_PAUSE_MS);
   }
@@ -189,9 +197,9 @@ export async function fetchClimateTemperatureContext({ lat, lon, eventEndTime, s
   const yearly = [];
   for (const y of yearlyBack) {
     try {
-      yearly.push(await fetchDailyTmax(station.id, shiftYears(eventDate, y)));
+      yearly.push(withSampleType(await fetchDailyTmax(station.id, shiftYears(eventDate, y)), 'yearly', 'yearsBack', y));
     } catch {
-      yearly.push({ day: toDateOnly(shiftYears(eventDate, y)), tmax: null });
+      yearly.push(withSampleType({ day: toDateOnly(shiftYears(eventDate, y)), tmax: null }, 'yearly', 'yearsBack', y));
     }
     await sleep(NOAA_PAUSE_MS);
   }
@@ -199,9 +207,9 @@ export async function fetchClimateTemperatureContext({ lat, lon, eventEndTime, s
   const lines = [];
   lines.push(`NOAA station: ${station.id} (${station.name || 'unknown'})`);
   lines.push(`NOAA recent TMAX (search-date minus ${formatDayOffsets(recentDaysBack)} days):`);
-  for (const r of recent) lines.push(`- ${r.day}: TMAX=${r.tmax == null ? 'n/a' : `${r.tmax.toFixed(1)}C`}`);
+  for (const r of recent.filter((s) => (s?.sampleType || 'recent') === 'recent')) lines.push(`- ${r.day}: TMAX=${r.tmax == null ? 'n/a' : `${r.tmax.toFixed(1)}C`}`);
   lines.push(`NOAA same-date TMAX last ${yearlyBack.length} years (event date anchor):`);
-  for (const y of yearly) lines.push(`- ${y.day}: TMAX=${y.tmax == null ? 'n/a' : `${y.tmax.toFixed(1)}C`}`);
+  for (const y of yearly.filter((s) => (s?.sampleType || 'yearly') === 'yearly')) lines.push(`- ${y.day}: TMAX=${y.tmax == null ? 'n/a' : `${y.tmax.toFixed(1)}C`}`);
 
   log.info(`NOAA parsed: station=${station.id} recent=${recent.length} yearly=${yearly.length}`);
   return {
