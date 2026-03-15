@@ -331,26 +331,12 @@ export function getDynamicTakeProfitPct(buyPrice) {
 }
 
 function decideBetAction(bet, currentPrice, buyPrice) {
-  const isExternalSynced = String(bet?.ai_reasoning || '').includes('Synced from Polymarket positions API');
   const takeProfitPct = getDynamicTakeProfitPct(buyPrice);
   const stopLossPct = config.stopLossPct ?? 0.25;
   const takeProfitDisableBeforeEndMinutes = Number(config.takeProfitDisableBeforeEndMinutes || 0);
-  const lossThreshold = 0.02; // price near zero = loss
 
   const takeProfitPrice = buyPrice > 0 ? buyPrice * (1 + takeProfitPct) : Number.POSITIVE_INFINITY;
   const stopLossPrice = buyPrice > 0 ? buyPrice * (1 - stopLossPct) : Number.NEGATIVE_INFINITY;
-
-  // Market resolved YES (price ~ 1.0)
-  if (currentPrice >= 0.98) return 'redeemed';
-
-  // Market resolved NO (price ~ 0.0)
-  if (currentPrice <= lossThreshold) return 'lost';
-
-  // Event expired
-  if (!isExternalSynced && bet.event_end) {
-    const endTime = new Date(bet.event_end).getTime();
-    if (Date.now() > endTime + 3600_000) return 'expired'; // 1h grace after end
-  }
 
   // Apply signed lockout relative to event end.
   const tpLockoutActive = isTakeProfitLockoutActive(bet, takeProfitDisableBeforeEndMinutes);

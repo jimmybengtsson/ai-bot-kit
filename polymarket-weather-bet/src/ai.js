@@ -6,6 +6,16 @@ import { retryWithBackoff } from './retry.js';
 const log = createLogger('ai');
 const client = new OpenAI({ apiKey: config.openaiApiKey });
 
+function noaaRecentOffsetsLabel() {
+  const start = config.noaaRecentDaysStart;
+  const count = config.noaaRecentDaysCount;
+  return Array.from({ length: count }, (_, i) => `D-${start + i}`).join(', ');
+}
+
+function noaaYearsLabel() {
+  return `last ${config.noaaSameDayYearsBackCount} years`;
+}
+
 const PICK_SCHEMA = {
   type: 'json_schema',
   name: 'temperature_pick',
@@ -38,51 +48,56 @@ const VALIDATION_SCHEMA = {
   },
 };
 
-const PICK_SYSTEM_PROMPT = [
-  'You are a meteorological decision engine for Polymarket temperature markets.',
-  'Your task is to choose at most one best temperature outcome bucket for a single event.',
-  'The target variable is the highest temperature for the full event day (00:00-23:59 local day), not temperature at resolution timestamp.',
-  'Use ONLY the provided weather context text and event metadata. Do not invent sources or facts.',
-  '',
-  'Decision objective:',
-  '- Maximize correctness of outcome-bucket selection, not narrative quality.',
-  '- If confidence is weak or outcome mapping is ambiguous, set shouldBet=false.',
-  '',
-  'Critical mapping rules:',
-  '- selectedOutcome must match one provided outcome string exactly (character-for-character).',
-  '- Pick the bucket for the day\'s peak temperature, not a single-hour reading at resolution time.',
-  '- Market resolution uses whole degrees Celsius; do not treat decimal forecast values as direct resolvers.',
-  '- Convert decimal forecast signals into likely whole-degree outcomes before mapping to buckets by rounding to the nearest integer (.5 rounds up).',
-  '- Example nearest-integer mapping: 9.3 -> 9, 9.9 -> 10.',
-  '- Do not return shouldBet=false only because forecast values include decimals.',
-  '- If data supports multiple adjacent buckets similarly, or boundary/rounding ambiguity is material, prefer shouldBet=false.',
-  '',
-  'Reasoning quality rules:',
-  '- reasoning must briefly cite concrete signals from provided context (forecast periods, current conditions, climate consistency).',
-  '- No chain-of-thought; return concise rationale only.',
-  '',
-  'Output policy:',
-  '- Return JSON only, matching the provided JSON schema exactly.',
-  '- confidence must be numeric and interpreted as 0-100.',
-  '- When shouldBet=false, selectedOutcome should be an empty string.',
-].join('\n');
+function buildPickSystemPrompt() {
+  return [
+    'You are a meteorological decision engine for Polymarket temperature markets.',
+    'Your task is to choose at most one best temperature outcome bucket for a single event.',
+    'The target variable is the highest temperature for the full event day (00:00-23:59 local day), not temperature at resolution timestamp.',
+    'Use ONLY the provided weather context text and event metadata. Do not invent sources or facts.',
+    '',
+    'Decision objective:',
+    '- Maximize correctness of outcome-bucket selection, not narrative quality.',
+    '- If confidence is weak or outcome mapping is ambiguous, set shouldBet=false.',
+    '',
+    'Critical mapping rules:',
+    '- selectedOutcome must match one provided outcome string exactly (character-for-character).',
+    '- Pick the bucket for the day\'s peak temperature, not a single-hour reading at resolution time.',
+    '- Market resolution uses whole degrees Celsius; do not treat decimal forecast values as direct resolvers.',
+    '- Convert decimal forecast signals into likely whole-degree outcomes before mapping to buckets by rounding to the nearest integer (.5 rounds up).',
+    '- Example nearest-integer mapping: 9.3 -> 9, 9.9 -> 10.',
+    '- Do not return shouldBet=false only because forecast values include decimals.',
+    '- If data supports multiple adjacent buckets similarly, or boundary/rounding ambiguity is material, prefer shouldBet=false.',
+    '',
+    'Reasoning quality rules:',
+    '- reasoning must briefly cite concrete signals from provided context (forecast periods, current conditions, climate consistency).',
+    `- NOAA climate context covers recent samples (${noaaRecentOffsetsLabel()}) and same-date ${noaaYearsLabel()}; use these windows explicitly in bucket reasoning when relevant.`,
+    '- No chain-of-thought; return concise rationale only.',
+    '',
+    'Output policy:',
+    '- Return JSON only, matching the provided JSON schema exactly.',
+    '- confidence must be numeric and interpreted as 0-100.',
+    '- When shouldBet=false, selectedOutcome should be an empty string.',
+  ].join('\n');
+}
 
-const VALIDATION_SYSTEM_PROMPT = [
-  'You are an independent weather-bet validator for Polymarket temperature outcomes.',
-  'You receive a prior pick and must verify if it remains the strongest choice from provided data only.',
-  'Do not defer to the first pick; reassess independently.',
-  '',
-  'Validation criteria:',
-  '- Does the selected outcome still align best with the expected full-day highest temperature (not just resolution hour)?',
-  '- Does whole-degree Celsius resolution support the selected bucket after handling decimal forecast noise?',
-  '- Is climate context directionally consistent with the selected bucket?',
-  '- Is mapping to bucket boundaries/precision defensible?',
-  '- If uncertainty is material or another bucket is similarly likely, return agrees=false.',
-  '',
-  'Output policy:',
-  '- Return JSON only, matching the provided JSON schema exactly.',
-  '- reasoning must be concise and specific to the acceptance/rejection decision.',
-].join('\n');
+function buildValidationSystemPrompt() {
+  return [
+    'You are an independent weather-bet validator for Polymarket temperature outcomes.',
+    'You receive a prior pick and must verify if it remains the strongest choice from provided data only.',
+    'Do not defer to the first pick; reassess independently.',
+    '',
+    'Validation criteria:',
+    '- Does the selected outcome still align best with the expected full-day highest temperature (not just resolution hour)?',
+    '- Does whole-degree Celsius resolution support the selected bucket after handling decimal forecast noise?',
+    '- Is climate context directionally consistent with the selected bucket?',
+    `- Is mapping to bucket boundaries/precision defensible given NOAA windows ${noaaRecentOffsetsLabel()} and ${noaaYearsLabel()}?`,
+    '- If uncertainty is material or another bucket is similarly likely, return agrees=false.',
+    '',
+    'Output policy:',
+    '- Return JSON only, matching the provided JSON schema exactly.',
+    '- reasoning must be concise and specific to the acceptance/rejection decision.',
+  ].join('\n');
+}
 
 function outcomesBlock(event) {
   return event.outcomes.map((o) => `- ${o.outcome}${o.label ? ` [label: ${o.label}]` : ''}`).join('\n');
@@ -121,7 +136,7 @@ async function callStructured(instructions, input, schema) {
 }
 
 export async function chooseTemperatureOutcome(event, weatherContextText) {
-  const instructions = PICK_SYSTEM_PROMPT;
+  const instructions = buildPickSystemPrompt();
   const eventDateUtc = new Date(event.endTime).toISOString().slice(0, 10);
 
   const input = [
@@ -151,7 +166,7 @@ export async function chooseTemperatureOutcome(event, weatherContextText) {
 }
 
 export async function validateTemperatureOutcome(event, weatherContextText, firstPick) {
-  const instructions = VALIDATION_SYSTEM_PROMPT;
+  const instructions = buildValidationSystemPrompt();
   const eventDateUtc = new Date(event.endTime).toISOString().slice(0, 10);
 
   const input = [

@@ -29,6 +29,9 @@ export const config = {
 
   get owmApiKey() { return getEffectiveSetting('OWM_API_KEY', process.env.OWM_API_KEY || ''); },
   get noaaCdoToken() { return getEffectiveSetting('NOAA_CDO_TOKEN', process.env.NOAA_CDO_TOKEN || ''); },
+  get noaaRecentDaysStart() { return asInt(getEffectiveSetting('NOAA_RECENT_DAYS_START', process.env.NOAA_RECENT_DAYS_START || '2'), 2); },
+  get noaaRecentDaysCount() { return asInt(getEffectiveSetting('NOAA_RECENT_DAYS_COUNT', process.env.NOAA_RECENT_DAYS_COUNT || '3'), 3); },
+  get noaaSameDayYearsBackCount() { return asInt(getEffectiveSetting('NOAA_SAME_DAY_YEARS_BACK_COUNT', process.env.NOAA_SAME_DAY_YEARS_BACK_COUNT || '5'), 5); },
 
   get port() { return asInt(getEffectiveSetting('PORT', process.env.PORT || '3010'), 3010); },
   get logLevel() { return getEffectiveSetting('LOG_LEVEL', process.env.LOG_LEVEL || 'info'); },
@@ -52,6 +55,15 @@ export function validateConfig() {
   if (!config.openaiApiKey) errors.push('OPENAI_API_KEY is required');
   if (!config.owmApiKey) errors.push('OWM_API_KEY is required');
   if (!config.noaaCdoToken) errors.push('NOAA_CDO_TOKEN is required');
+  if (config.noaaRecentDaysStart < 1 || config.noaaRecentDaysStart > 30) {
+    errors.push('NOAA_RECENT_DAYS_START must be in [1,30]');
+  }
+  if (config.noaaRecentDaysCount < 1 || config.noaaRecentDaysCount > 30) {
+    errors.push('NOAA_RECENT_DAYS_COUNT must be in [1,30]');
+  }
+  if (config.noaaSameDayYearsBackCount < 1 || config.noaaSameDayYearsBackCount > 20) {
+    errors.push('NOAA_SAME_DAY_YEARS_BACK_COUNT must be in [1,20]');
+  }
   if (config.dailyBetSlots <= 0) errors.push('DAILY_BET_SLOTS must be > 0');
   if (config.scanWindowMinHours < 0 || config.scanWindowMaxHours <= config.scanWindowMinHours) {
     errors.push('Invalid scan window: ensure SCAN_WINDOW_MAX_HOURS > SCAN_WINDOW_MIN_HOURS');

@@ -1,7 +1,7 @@
 import { CronJob } from 'cron';
 import { config } from './config.js';
 import { createLogger } from './logger.js';
-import { ensureAllowances, getBalance } from './wallet.js';
+import { ensureAllowances, getAddress, getBalance } from './wallet.js';
 import { scanForTemperatureEvents } from './skills/eventScanner.js';
 import { fetchTemperatureForecastContext } from './skills/weatherFetcher.js';
 import { fetchClimateTemperatureContext } from './skills/climateFetcher.js';
@@ -27,6 +27,15 @@ const PORTFOLIO_CRON = '*/5 * * * *';
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getAccountForQueries() {
+  if (config.funderAddress) return config.funderAddress;
+  try {
+    return getAddress();
+  } catch {
+    return '';
+  }
 }
 
 function toNum(...vals) {
@@ -220,7 +229,7 @@ async function runPortfolioSnapshotJob(trigger = 'cron-5m') {
   const startedAt = new Date().toISOString();
 
   try {
-    const account = config.funderAddress;
+    const account = getAccountForQueries();
     const [balanceUsd, positions, openOrders] = await Promise.all([
       getBalance(),
       getPolymarketPositions(account),
@@ -361,8 +370,9 @@ export async function runDailyTemperatureJob(trigger = 'cron') {
       return summary;
     }
 
-    let positions = await getPolymarketPositions(config.funderAddress);
-    let openOrders = await getOpenOrders(config.funderAddress);
+    const account = getAccountForQueries();
+    let positions = await getPolymarketPositions(account);
+    let openOrders = await getOpenOrders(account);
     let slotsUsed = countUsedSlots(events, positions);
     summary.slotsUsedInitial = slotsUsed;
     summary.openTodayInitial = countTodaysOpenBuyOrders(openOrders);
@@ -379,8 +389,8 @@ export async function runDailyTemperatureJob(trigger = 'cron') {
     }
 
     for (const event of events) {
-      positions = await getPolymarketPositions(config.funderAddress);
-      openOrders = await getOpenOrders(config.funderAddress);
+      positions = await getPolymarketPositions(account);
+      openOrders = await getOpenOrders(account);
       slotsUsed = countUsedSlots(events, positions);
 
       if (slotsUsed >= config.dailyBetSlots) {

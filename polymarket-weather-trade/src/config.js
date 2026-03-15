@@ -72,6 +72,9 @@ export const config = {
 
   // NOAA Climate Data Online API v2 token
   get noaaCdoToken() { return asString('NOAA_CDO_TOKEN', ''); },
+  get noaaRecentDaysStart() { return asInt('NOAA_RECENT_DAYS_START', 1); },
+  get noaaRecentDaysCount() { return asInt('NOAA_RECENT_DAYS_COUNT', 2); },
+  get noaaSameDayYearsBackCount() { return asInt('NOAA_SAME_DAY_YEARS_BACK_COUNT', 5); },
 
 
   // Telegram Bot (notifications & commands)
@@ -189,6 +192,15 @@ export function validateConfig() {
   }
   if (!config.noaaCdoToken) {
     errors.push('NOAA_CDO_TOKEN is required — request a token at https://www.ncdc.noaa.gov/cdo-web/token');
+  }
+  if (config.noaaRecentDaysStart < 1 || config.noaaRecentDaysStart > 30) {
+    errors.push(`NOAA_RECENT_DAYS_START must be in [1,30], got ${config.noaaRecentDaysStart}`);
+  }
+  if (config.noaaRecentDaysCount < 1 || config.noaaRecentDaysCount > 30) {
+    errors.push(`NOAA_RECENT_DAYS_COUNT must be in [1,30], got ${config.noaaRecentDaysCount}`);
+  }
+  if (config.noaaSameDayYearsBackCount < 1 || config.noaaSameDayYearsBackCount > 20) {
+    errors.push(`NOAA_SAME_DAY_YEARS_BACK_COUNT must be in [1,20], got ${config.noaaSameDayYearsBackCount}`);
   }
   if (getSetting('TAKE_PROFIT_PCT', '') === '') {
     warnings.push('TAKE_PROFIT_PCT not set — using default 0.40');

@@ -40,6 +40,9 @@ const SETTINGS_SCHEMA = [
   { key: 'OPENAI_MODEL', type: 'string', minLength: 1, applyMode: 'realtime', description: 'OpenAI model name.' },
   { key: 'OWM_API_KEY', type: 'string', applyMode: 'realtime', description: 'OpenWeatherMap API key.' },
   { key: 'NOAA_CDO_TOKEN', type: 'string', applyMode: 'realtime', description: 'NOAA CDO API token.' },
+  { key: 'NOAA_RECENT_DAYS_START', type: 'number', integer: true, min: 1, max: 30, applyMode: 'realtime', description: 'Starting recent day offset for NOAA samples (D-start).' },
+  { key: 'NOAA_RECENT_DAYS_COUNT', type: 'number', integer: true, min: 1, max: 30, applyMode: 'realtime', description: 'Number of recent NOAA daily samples to fetch.' },
+  { key: 'NOAA_SAME_DAY_YEARS_BACK_COUNT', type: 'number', integer: true, min: 1, max: 20, applyMode: 'realtime', description: 'Number of same-date prior years to fetch from NOAA.' },
   { key: 'PORT', type: 'number', integer: true, min: 1, max: 65535, applyMode: 'restart', description: 'Express server port.' },
   {
     key: 'LOG_LEVEL',

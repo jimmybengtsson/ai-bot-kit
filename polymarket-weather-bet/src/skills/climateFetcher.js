@@ -6,6 +6,21 @@ const log = createLogger('climate');
 const NOAA_BASE = 'https://www.ncei.noaa.gov/cdo-web/api/v2';
 const NOAA_PAUSE_MS = 300;
 
+function recentDayOffsets() {
+  const start = config.noaaRecentDaysStart;
+  const count = config.noaaRecentDaysCount;
+  return Array.from({ length: count }, (_, i) => start + i);
+}
+
+function yearlyOffsets() {
+  const count = config.noaaSameDayYearsBackCount;
+  return Array.from({ length: count }, (_, i) => i + 1);
+}
+
+function formatDayOffsets(offsets) {
+  return offsets.map((d) => `${d}`).join('/');
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -148,18 +163,18 @@ export async function fetchClimateTemperatureContext({ lat, lon, eventEndTime, s
     return { text: 'NOAA unavailable: missing coordinates', recent: [], yearly: [], stationId: null };
   }
 
+  const recentDaysBack = recentDayOffsets();
+  const yearlyBack = yearlyOffsets();
+
   const eventDate = new Date(eventEndTime);
   const station = await chooseStationWithData(Number(lat), Number(lon), [
-    shiftDays(searchTime, 2),
+    shiftDays(searchTime, recentDaysBack[0]),
     eventDate,
     shiftYears(eventDate, 1),
   ]);
   if (!station?.id) {
     return { text: 'NOAA unavailable: no station found', recent: [], yearly: [], stationId: null };
   }
-
-  const recentDaysBack = [2, 3, 4];
-  const yearlyBack = [1, 2, 3, 4, 5];
 
   const recent = [];
   for (const d of recentDaysBack) {
@@ -183,9 +198,9 @@ export async function fetchClimateTemperatureContext({ lat, lon, eventEndTime, s
 
   const lines = [];
   lines.push(`NOAA station: ${station.id} (${station.name || 'unknown'})`);
-  lines.push('NOAA recent TMAX (search-date minus 2/3/4 days):');
+  lines.push(`NOAA recent TMAX (search-date minus ${formatDayOffsets(recentDaysBack)} days):`);
   for (const r of recent) lines.push(`- ${r.day}: TMAX=${r.tmax == null ? 'n/a' : `${r.tmax.toFixed(1)}C`}`);
-  lines.push('NOAA same-date TMAX last 5 years (event date anchor):');
+  lines.push(`NOAA same-date TMAX last ${yearlyBack.length} years (event date anchor):`);
   for (const y of yearly) lines.push(`- ${y.day}: TMAX=${y.tmax == null ? 'n/a' : `${y.tmax.toFixed(1)}C`}`);
 
   log.info(`NOAA parsed: station=${station.id} recent=${recent.length} yearly=${yearly.length}`);

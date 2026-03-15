@@ -63,12 +63,23 @@ function formatDecisionLog(eventTitle, parsed, bets) {
   return lines.join('\n');
 }
 
-const SYSTEM_PROMPT = `You are an expert meteorologist and weather betting advisor for Polymarket prediction markets.
+function noaaRecentOffsetsLabel() {
+  const start = config.noaaRecentDaysStart;
+  const count = config.noaaRecentDaysCount;
+  return Array.from({ length: count }, (_, i) => `D-${start + i}`).join(', ');
+}
+
+function noaaYearWindowLabel() {
+  return `last ${config.noaaSameDayYearsBackCount} years`;
+}
+
+function buildSystemPrompt() {
+  return `You are an expert meteorologist and weather betting advisor for Polymarket prediction markets.
 
 YOU MUST USE ONLY THE PROVIDED DATA (NO WEB SEARCH):
 - Event title, description, and resolution details from Polymarket
 - OpenWeatherMap current observed weather + 5-day / 3-hour forecast data already fetched by the bot
-- NOAA CDO v2 daily observations sampled at event-end aligned timing: last 2 days + same date/time in each of last 5 years
+- NOAA CDO v2 daily observations sampled at event-end aligned timing: ${noaaRecentOffsetsLabel()} + same date/time in each of ${noaaYearWindowLabel()}
 - Outcome prices and odds movement context
 
 CRITICAL RESOLUTION RULES:
@@ -91,7 +102,7 @@ FOR THE EVENT YOU RECEIVE:
 - Price spread and which side is currently cheapest (context only, not a strict rule)
 - OpenWeatherMap forecast periods around resolution time
 - OpenWeatherMap current observed conditions for the location
-- NOAA station-based climate daily samples aligned to event-end timing for recent days and years -1 to -5
+- NOAA station-based climate daily samples aligned to event-end timing for recent days (${noaaRecentOffsetsLabel()}) and years -1 to -${config.noaaSameDayYearsBackCount}
 - Price change context for each outcome over 24h, 6h, 1h (plus short-term 10m)
 - Active bets, recent history, and recent AI accuracy
 
@@ -99,7 +110,7 @@ YOUR ANALYSIS MUST COVER:
 1. Forecast confidence near resolution time
 2. Forecast uncertainty (temperature swing, wind/precip volatility)
 3. NOAA climate signal consistency (recent observed highs/lows/precip vs forecast path)
-4. Seasonal context from same-window NOAA data across the last 5 years
+4. Seasonal context from same-window NOAA data across the ${noaaYearWindowLabel()}
 5. Market mispricing: estimated probability vs implied market probability
 6. Time proximity: events resolving sooner should have tighter confidence bands
 7. Price momentum/regime from 24h, 6h, and 1h changes and whether movement supports or contradicts forecast view
@@ -132,6 +143,7 @@ LOSING STREAK AWARENESS:
 - Never chase losses
 
 Respond ONLY with valid JSON matching the required schema.`;
+}
 
 const BET_PROPERTIES = {
   predictedOutcome: {
@@ -218,7 +230,7 @@ async function runAnalysisRequest(userMessage) {
   const response = await retryWithBackoff(
     () => client.responses.create({
       model: config.openaiModel,
-      instructions: SYSTEM_PROMPT,
+      instructions: buildSystemPrompt(),
       input: userMessage,
       text: { format: BETTING_DECISION_SCHEMA },
       store: false,

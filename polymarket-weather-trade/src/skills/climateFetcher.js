@@ -8,6 +8,21 @@ const NOAA_BASE = 'https://www.ncei.noaa.gov/cdo-web/api/v2';
 const NOAA_REQUEST_PAUSE_MS = 350;
 const stationCache = new Map();
 
+function recentDayOffsets() {
+  const start = config.noaaRecentDaysStart;
+  const count = config.noaaRecentDaysCount;
+  return Array.from({ length: count }, (_, i) => start + i);
+}
+
+function yearlyOffsets() {
+  const count = config.noaaSameDayYearsBackCount;
+  return Array.from({ length: count }, (_, i) => i + 1);
+}
+
+function formatRecentOffsetsForLog(offsets) {
+  return offsets.map((d) => `D-${d}`).join(', ');
+}
+
 function toIsoDayUtc(date) {
   return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate())).toISOString().slice(0, 10);
 }
@@ -187,9 +202,9 @@ async function findNearestStation(lat, lon) {
 }
 
 /**
- * Fetch NOAA observations with low-request strategy:
- * - 2 recent daily points at the event-end hour (D-1, D-2)
- * - 5 historical daily points at same date/time in prior years
+ * Fetch NOAA observations with configurable low-request strategy:
+ * - N recent daily points at event-end aligned timing (starting from D-start)
+ * - M historical daily points at same date/time in prior years
  *
  * Calls are intentionally sequential to avoid request bursts.
  *
@@ -208,6 +223,8 @@ export async function fetchClimateData({ locationName, lat, lon, eventEndTime })
   const eventTime = Number.isNaN(parsedEventTime.getTime()) ? now : parsedEventTime;
   const sampleAnchor = eventTime;
   const targetHourUtc = extractTargetHourUtc(eventTime);
+  const recentDaysBack = recentDayOffsets();
+  const yearlyBack = yearlyOffsets();
 
   const station = await findNearestStation(lat, lon);
   if (!station?.id) {
@@ -216,7 +233,7 @@ export async function fetchClimateData({ locationName, lat, lon, eventEndTime })
 
   log.info(`NOAA station selected: ${station.id} (${station.name || 'unknown'})`);
   log.info(`NOAA sampling anchor: event=${eventTime.toISOString()} sample_anchor=${sampleAnchor.toISOString()} now=${now.toISOString()}`);
-  log.info('NOAA request plan: 1 station lookup + 7 sequential /data calls (D-1, D-2, and years -1..-5)');
+  log.info(`NOAA request plan: 1 station lookup + ${recentDaysBack.length + yearlyBack.length} sequential /data calls (${formatRecentOffsetsForLog(recentDaysBack)} and years -1..-${yearlyBack.length})`);
 
   const datatypeIds = ['TMAX', 'TMIN', 'TAVG', 'PRCP', 'SNOW', 'SNWD'];
 
@@ -263,7 +280,7 @@ export async function fetchClimateData({ locationName, lat, lon, eventEndTime })
   }
 
   const recentSamples = [];
-  for (const daysBack of [1, 2]) {
+  for (const daysBack of recentDaysBack) {
     const d = shiftDays(sampleAnchor, daysBack);
     const sampleDay = toIsoDayUtc(d);
     if (!stationSupportsDate(station, sampleDay)) {
@@ -294,7 +311,7 @@ export async function fetchClimateData({ locationName, lat, lon, eventEndTime })
   }
 
   const yearlyComparisons = [];
-  for (const yearsBack of [1, 2, 3, 4, 5]) {
+  for (const yearsBack of yearlyBack) {
     const d = shiftYears(eventTime, yearsBack);
     const sampleDay = toIsoDayUtc(d);
     if (!stationSupportsDate(station, sampleDay)) {
@@ -324,7 +341,7 @@ export async function fetchClimateData({ locationName, lat, lon, eventEndTime })
     await sleep(NOAA_REQUEST_PAUSE_MS);
   }
 
-  log.info(`NOAA sampling complete: recent=${recentSamples.length}, yearly=${yearlyComparisons.length}, total_data_requests=7`);
+  log.info(`NOAA sampling complete: recent=${recentSamples.length}, yearly=${yearlyComparisons.length}, total_data_requests=${recentDaysBack.length + yearlyBack.length}`);
 
   return {
     locationName,
@@ -332,10 +349,12 @@ export async function fetchClimateData({ locationName, lat, lon, eventEndTime })
     lon,
     station,
     requestedWindow: {
-      strategy: '2 recent daily samples + 5 yearly daily samples (sequential)',
+      strategy: `${recentDaysBack.length} recent daily samples (start D-${recentDaysBack[0]}) + ${yearlyBack.length} yearly daily samples (sequential)`,
       eventEndTime: eventTime.toISOString(),
       targetHourUtc,
       requestedAt: now.toISOString(),
+      recentDaysBack,
+      yearlyBack,
     },
     records: recentSamples.flatMap((s) => s.records || []),
     recentSamples,
@@ -407,7 +426,14 @@ export function formatClimateDataForAI(data) {
   }
 
   lines.push('');
-  lines.push('--- RECENT DAILY OBSERVATIONS (D-1, D-2) --- [TMAX/TMIN are full-day values]');
+  const recentWindow = Array.isArray(data?.requestedWindow?.recentDaysBack)
+    ? data.requestedWindow.recentDaysBack.map((d) => `D-${d}`).join(', ')
+    : 'D-1, D-2';
+  const yearlyCount = Array.isArray(data?.requestedWindow?.yearlyBack)
+    ? data.requestedWindow.yearlyBack.length
+    : 5;
+
+  lines.push(`--- RECENT DAILY OBSERVATIONS (${recentWindow}) --- [TMAX/TMIN are full-day values]`);
   for (const sample of recent.sort((a, b) => a.daysBack - b.daysBack)) {
     if (sample.error) {
       lines.push(`${sample.daysBack}d ago (${sample.date}) | ERROR: ${sample.error}`);
@@ -429,7 +455,7 @@ export function formatClimateDataForAI(data) {
   }
 
   lines.push('');
-  lines.push('--- SAME DATE DAILY OBSERVATIONS: LAST 5 YEARS --- [TMAX/TMIN are full-day values]');
+  lines.push(`--- SAME DATE DAILY OBSERVATIONS: LAST ${yearlyCount} YEARS --- [TMAX/TMIN are full-day values]`);
   if (yearly.length === 0) {
     lines.push('No yearly comparison windows available.');
   } else {

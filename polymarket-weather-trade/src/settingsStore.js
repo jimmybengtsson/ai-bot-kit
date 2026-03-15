@@ -117,6 +117,18 @@ function validateSettingValue(name, value) {
       const n = parseNumber(v);
       return inRange(n, { min: 0, minInclusive: false }) ? null : 'Must be a number > 0';
     }
+    case 'NOAA_RECENT_DAYS_START': {
+      const n = parseNumber(v, { integer: true });
+      return inRange(n, { min: 1, max: 30 }) ? null : 'Must be an integer in [1, 30]';
+    }
+    case 'NOAA_RECENT_DAYS_COUNT': {
+      const n = parseNumber(v, { integer: true });
+      return inRange(n, { min: 1, max: 30 }) ? null : 'Must be an integer in [1, 30]';
+    }
+    case 'NOAA_SAME_DAY_YEARS_BACK_COUNT': {
+      const n = parseNumber(v, { integer: true });
+      return inRange(n, { min: 1, max: 20 }) ? null : 'Must be an integer in [1, 20]';
+    }
     case 'LOW_BET_TAKE_PROFIT':
     case 'HIGH_BET_TAKE_PROFIT': {
       const n = parseNumber(v);
