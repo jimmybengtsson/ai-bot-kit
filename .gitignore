@@ -1,0 +1,37 @@
+# Monorepo defaults
+**/node_modules/
+**/.env
+**/npm-debug.log*
+**/.DS_Store
+
+# Runtime outputs
+**/logs/
+**/*.log
+
+# Local app data/state
+**/data/
+**/.cache/
+**/profile/
+
+# AI working notes (do not push)
+**/MEMORY.md
+**/MISTAKES.md
+
+# AI prompt/agent customization files (do not push)
+**/prompt.md
+**/prompts.md
+**/PROMPT.md
+**/PROMPTS.md
+**/skill.md
+**/skills.md
+**/SKILL.md
+**/SKILLS.md
+**/agent.md
+**/agents.md
+**/AGENT.md
+**/AGENTS.md
+**/*.instructions.md
+**/*.prompt.md
+**/*.agent.md
+**/copilot-instructions.md
+**/.copilot-instructions.md

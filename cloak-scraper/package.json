@@ -1,0 +1,31 @@
+{
+  "name": "cloak-scraper",
+  "version": "1.0.0",
+  "description": "Stealth scraping API server powered by CloakBrowser for server-to-server use",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "check": "node --check src/server.js",
+    "pm2:start": "pm2 start ecosystem.config.cjs --env production",
+    "pm2:restart": "pm2 restart cloak-scraper",
+    "pm2:stop": "pm2 stop cloak-scraper"
+  },
+  "keywords": [
+    "scraper",
+    "api",
+    "cloakbrowser",
+    "playwright",
+    "x",
+    "google"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "cloakbrowser": "^0.3.16",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "playwright-core": "^1.53.0"
+  }
+}
