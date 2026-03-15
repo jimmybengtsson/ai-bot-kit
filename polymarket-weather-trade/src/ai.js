@@ -76,8 +76,9 @@ CRITICAL RESOLUTION RULES:
 - Use the forecast period closest to the event resolution timestamp (marked with <<<EVENT)
 - If nearest periods are borderline between two outcomes, lower confidence
 - If the event description says resolution uses whole degrees (for example "9°C"), treat this as integer precision from the source feed, not decimal rounding from your model forecast.
-- For single-degree buckets (e.g., "be 10°C"), do NOT round decimal forecasts up; use conservative integer mapping (9.8°C aligns with 9°C unless strong evidence supports 10°C in the source's finalized whole-degree record).
-- For range buckets (e.g., "between 9-10°C"), map using integer precision consistently and avoid optimistic rounding-up.
+- For single-degree buckets (e.g., "be 10°C"), map decimal forecasts to whole degrees using nearest-integer rounding (.5 rounds up).
+- For range buckets (e.g., "between 9-10°C"), apply the same nearest-integer mapping consistently before evaluating bucket fit.
+- Example nearest-integer mapping: 9.3°C aligns with 9°C, 9.9°C aligns with 10°C.
 
 YOU WILL RECEIVE A SINGLE WEATHER EVENT with all its market outcomes (temperature buckets, etc.).
 Each outcome is a separate YES/NO market for one bucket — exactly one bucket resolves YES.
@@ -123,7 +124,7 @@ IMPORTANT — NEG-RISK MULTI-OUTCOME MARKETS:
 
 RESOLUTION PRECISION SAFETY:
 - Event description resolution rules are authoritative.
-- If description specifies whole-degree precision, avoid choosing a higher single-degree bucket based only on decimal forecast rounding.
+- If description specifies whole-degree precision, map decimal forecasts to whole degrees with nearest-integer rounding (.5 rounds up) before bucket selection.
 - When precision interpretation is ambiguous, reduce confidence or return NO BET.
 
 LOSING STREAK AWARENESS:
@@ -322,7 +323,7 @@ ${activeBetsStr || 'None'}`;
     userMessage += `\n\nYOUR RECENT ACCURACY:\n${accuracySummary}`;
   }
 
-  userMessage += `\n\nAnalyze this event using the weather forecast and climate data. Recommend either BET or NO BET. If BET, return exactly one bet and it must be YES side for the single most likely temperature outcome bucket. Respect event-description precision rules exactly: when resolution says whole degrees, do not round decimal forecasts up to pick a higher single-degree bucket (e.g., 9.8 should map conservatively to 9 unless strong source-evidence supports 10). If confidence is too low or precision is ambiguous, return an empty bets array. Require >= 3% edge.`;
+  userMessage += `\n\nAnalyze this event using the weather forecast and climate data. Recommend either BET or NO BET. If BET, return exactly one bet and it must be YES side for the single most likely temperature outcome bucket. Respect event-description precision rules exactly: when resolution says whole degrees, map decimal forecasts using nearest-integer rounding (.5 rounds up; e.g., 9.3 -> 9 and 9.9 -> 10) before selecting the bucket. If confidence is too low or precision is ambiguous, return an empty bets array. Require >= 3% edge.`;
 
   log.info(`AI analyzing: "${event.title?.slice(0, 60)}"`);
   log.debug(`AI prompt length: ${userMessage.length} chars`);
