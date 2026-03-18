@@ -7,12 +7,14 @@ import { runHealthChecks } from './health.js';
 import { scanForWeatherEvents } from './skills/eventScanner.js';
 import { fetchWeatherData, formatWeatherDataForAI } from './skills/weatherFetcher.js';
 import { fetchClimateData, formatClimateDataForAI } from './skills/climateFetcher.js';
-import { analyzeWeatherEvent } from './ai.js';
-import { placeBet, checkBetStatuses, getPriceHistory, getPolymarketOpenOrders, getCurrentExitPrice, getCurrentEntryPrice, getDynamicTakeProfitPct } from './skills/betExecutor.js';
+import { analyzeWeatherEvent, validateWeatherBetCandidate } from './ai.js';
+import { matchOutcome } from './outcomeMatcher.js';
+import { placeBet, checkBetStatuses, getPriceHistory, getPolymarketOpenOrders, getCurrentExitPrice, getCurrentEntryPrice, getDynamicTakeProfitPct, getLiquidityQuality } from './skills/betExecutor.js';
 import { cancelPolymarketOrder } from './adapters/clob.js';
 import { riskManager } from './skills/riskManager.js';
 import { notify } from './telegram.js';
 import { startRealtimeMonitor, stopRealtimeMonitor, syncRealtimeSubscriptions } from './realtimeMonitor.js';
+import { finishStatusTick, requestStatusTick } from './statusTickQueue.js';
 import {
   recordBet, updateBetStatus, updateBetOrderId, getActiveBets,
   getActiveBetCount, getRecentBets, hasOpenBetForToken, getTodayStats,
@@ -21,8 +23,27 @@ import {
   recordOddsSnapshot, formatOddsMovementForAI, pruneOldOddsSnapshots,
   recordTokenUsage, getTodayTokenUsage, getAIAccuracySummary,
   saveWeatherEvent, updateWeatherEventStatus, expireOldWeatherEvents,
-  refreshExchangeState,
+  refreshExchangeState, getDailyUniqueExposureCount, getEventExposureSnapshot,
+  getEventVolatilitySummary,
 } from './memory.js';
+import { getTradingMode, isExecutionEnabled, isOffMode } from './tradingMode.js';
+import { evaluateBoundaryNoTrade, shouldRunAiValidator } from './strategyGuards.js';
+import {
+  beginExecution,
+  buildExecutionKey,
+  canExecuteInScope,
+  markExecutionFailed,
+  markExecutionFilled,
+  markExecutionPartialFill,
+  markExecutionSubmitted,
+  recordExecutionFailure,
+  recordExecutionSuccess,
+  recordIncident,
+  reconcileExpectedFills,
+  getOpenEntryIntents,
+} from './executionStore.js';
+import { incrementMetric, recordAvailabilityTick, recordLatencySample, recordMetricEvent } from './telemetryStore.js';
+import { recordAuditEvent } from './auditStore.js';
 
 const log = createLogger('scheduler');
 
@@ -36,78 +57,6 @@ function validateEvent(e) {
   const hasValidOutcome = e.outcomes.some(o => o.tokenId && typeof o.price === 'number' && o.price > 0);
   if (!hasValidOutcome) return { valid: false, reason: 'no outcome with tokenId & price > 0' };
   return { valid: true };
-}
-
-/**
- * Match AI's predictedOutcome to available market outcomes.
- */
-function matchOutcome(predicted, outcomes) {
-  if (!predicted || !outcomes?.length) return null;
-  const raw = predicted.trim();
-
-  // Normalize side-prefixed AI strings like:
-  // "YES - Will ...", "NO: ...", "YES — ..."
-  const withoutSidePrefix = raw.replace(/^\s*(yes|no)\s*[-:–—]\s*/i, '').trim();
-  const pCandidates = [raw, withoutSidePrefix].filter(Boolean);
-
-  const norm = (s) => String(s || '')
-    .toLowerCase()
-    .replace(/[\u2012\u2013\u2014\u2015]/g, '-') // normalize dashes
-    .replace(/[^a-z0-9]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  const candidateNorms = pCandidates.map(norm).filter(Boolean);
-
-  // Compare against both the full market question and the cleaner label/bucket.
-  const outcomeTexts = outcomes.map((o) => ({
-    o,
-    text: String(o.outcome || ''),
-    label: String(o.label || ''),
-  }));
-
-  // Exact match
-  for (const p of pCandidates) {
-    const exact = outcomeTexts.find((x) => x.text === p || x.label === p);
-    if (exact) return exact.o;
-  }
-
-  // Case-insensitive
-  for (const p of pCandidates) {
-    const pLower = p.toLowerCase();
-    const ciExact = outcomeTexts.find((x) => x.text.toLowerCase() === pLower || x.label.toLowerCase() === pLower);
-    if (ciExact) return ciExact.o;
-  }
-
-  // Yes/No alias matching
-  const yesAliases = new Set(['yes', 'over', 'above', 'true']);
-  const noAliases = new Set(['no', 'under', 'below', 'false']);
-  if (pCandidates.some((p) => yesAliases.has(p.toLowerCase()))) {
-    const yesOutcome = outcomes.find(o => yesAliases.has((o.outcome || '').toLowerCase()));
-    if (yesOutcome) return yesOutcome;
-  }
-  if (pCandidates.some((p) => noAliases.has(p.toLowerCase()))) {
-    const noOutcome = outcomes.find(o => noAliases.has((o.outcome || '').toLowerCase()));
-    if (noOutcome) return noOutcome;
-  }
-
-  // Normalized exact match against outcome and label.
-  for (const pNorm of candidateNorms) {
-    const normalizedExact = outcomeTexts.find((x) => norm(x.text) === pNorm || norm(x.label) === pNorm);
-    if (normalizedExact) return normalizedExact.o;
-  }
-
-  // Normalized contains match against outcome and label.
-  for (const pNorm of candidateNorms) {
-    const normalizedContains = outcomeTexts.find((x) => {
-      const textNorm = norm(x.text);
-      const labelNorm = norm(x.label);
-      return textNorm.includes(pNorm) || pNorm.includes(textNorm) || labelNorm.includes(pNorm) || pNorm.includes(labelNorm);
-    });
-    if (normalizedContains) return normalizedContains.o;
-  }
-
-  return null;
 }
 
 function normalizeEventSignature(event) {
@@ -147,7 +96,6 @@ const ANALYSIS_TIMEOUT_MS = 10 * 60_000;
 const ORDER_CANCEL_STALE_MINUTES = 10;
 const THROTTLE_NO_ACTIVE_MS = 15 * 60_000;
 const THROTTLE_ORDER_SUMMARY_MS = 5 * 60_000;
-const STATUS_FALLBACK_CRON = '*/10 * * * *';
 
 const throttledInfoState = new Map();
 
@@ -183,6 +131,12 @@ export async function weatherScan() {
   const scanStart = Date.now();
 
   log.info(`Weather scan started @ ${new Date().toISOString()}`);
+  const tradingMode = getTradingMode();
+  log.info(`Trading mode: ${tradingMode}`);
+
+  if (isOffMode(tradingMode)) {
+    appendDailyLog('SCAN: trading mode is off (discovery only, no execution)');
+  }
 
   let eventsFound = 0;
   let betsPlaced = 0;
@@ -197,17 +151,21 @@ export async function weatherScan() {
     // Health check
     const health = await runHealthChecks();
     if (!health.healthy) {
+      recordAvailabilityTick(false, { source: 'weather_scan' });
+      incrementMetric('api_error', 1, { source: 'health_check' });
       const failed = health.checks.filter(c => !c.ok).map(c => `${c.name}: ${c.detail}`);
       log.error(`Health check failed: ${failed.join(', ')} — aborting scan`);
       appendDailyLog(`SCAN ABORTED: health check failed — ${failed.join(', ')}`);
       return;
     }
+    recordAvailabilityTick(true, { source: 'weather_scan' });
 
     // Balance check
     const balance = await getBalance();
     state.lastBalance = balance;
     riskManager.setBalance(balance);
     if (balance < config.minBalanceStop) {
+      incrementMetric('gate_rejection', 1, { source: 'balance', reason: 'min_balance_stop' });
       log.error(`Balance critical: $${balance.toFixed(2)} — aborting scan`);
       appendDailyLog(`SCAN ABORTED: balance $${balance.toFixed(2)} below minimum`);
       return;
@@ -374,6 +332,8 @@ export async function weatherScan() {
     state.lastDecisions = decisions;
 
   } catch (err) {
+    incrementMetric('api_error', 1, { source: 'weather_scan' });
+    recordMetricEvent('api_error', { source: 'weather_scan', error: err.message }, { severity: 'warn' });
     logDetailedError(log, 'Weather scan failed', err);
     appendDailyLog(`Scan error: ${err.message}`);
     notify.error({ context: 'Weather scan', error: err.message }).catch(() => {});
@@ -382,6 +342,7 @@ export async function weatherScan() {
     state.lastScan = new Date().toISOString();
 
     const elapsed = ((Date.now() - scanStart) / 1000).toFixed(1);
+    recordLatencySample('weather_scan', Number(elapsed) * 1000, true, { eventsFound, betsPlaced });
     log.info(`Weather scan complete: found=${eventsFound} placed=${betsPlaced} elapsed=${elapsed}s`);
 
     appendDailyLog(`Scan: ${eventsFound} events, ${betsPlaced} bets placed (${elapsed}s)`);
@@ -403,12 +364,38 @@ export async function weatherScan() {
 // ─── Event Preparation (pre-filter + fetch data) ───────────────────────────
 
 async function prepareEventData(event) {
+  const eventTokenIds = (event.outcomes || []).map((o) => o?.tokenId).filter(Boolean);
+
   // Skip immediately if any outcome token is already open (avoid duplicate/copy analysis costs).
-  const outcomesWithToken = (event.outcomes || []).filter(o => o.tokenId);
+  const outcomesWithToken = (event.outcomes || []).filter((o) => o.tokenId);
   const openOutcomeCount = outcomesWithToken.filter(o => hasOpenBetForToken(o.tokenId)).length;
   if (openOutcomeCount > 0) {
     log.info('  Event already has an open position (token overlap) — skipping');
     updateWeatherEventStatus(event.eventId, 'skipped');
+    return null;
+  }
+
+  const inFlightEntryIntents = getOpenEntryIntents(500);
+  const eventExposure = getEventExposureSnapshot({
+    eventId: event.eventId,
+    eventTokenIds,
+    inFlightIntents: inFlightEntryIntents,
+  });
+  if (eventExposure.hasExposure) {
+    incrementMetric('gate_rejection', 1, { source: 'event_exposure', reason: 'already_exposed' });
+    const reason = `Event exposure already active (${eventExposure.reasons.join(', ')})`;
+    log.info(`  ${reason} — skipping`);
+    appendDailyLog(`SKIP: "${event.title?.slice(0, 40)}" — ${reason}`);
+    updateWeatherEventStatus(event.eventId, 'skipped');
+    return null;
+  }
+
+  const uniqueExposureCount = getDailyUniqueExposureCount({ inFlightIntents: inFlightEntryIntents });
+  const uniqueBudget = riskManager.checkUniqueDailyExposureBudget(uniqueExposureCount);
+  if (!uniqueBudget.allowed) {
+    incrementMetric('gate_rejection', 1, { source: 'unique_exposure_budget', reason: 'daily_budget_reached' });
+    log.warn(`  Risk check blocked: ${uniqueBudget.reason}`);
+    appendDailyLog(`SKIP: "${event.title?.slice(0, 40)}" — ${uniqueBudget.reason}`);
     return null;
   }
 
@@ -531,6 +518,10 @@ async function processEvent(prepared) {
   for (let bidx = 0; bidx < bets.length; bidx++) {
     const bet = bets[bidx];
     const result = { shouldBet: true, betPlaced: false, reasoning: bet.reasoning || '', predictedOutcome: bet.predictedOutcome, confidence: bet.confidence || 0 };
+    const volatilitySummary = getEventVolatilitySummary(event.eventId, event.outcomes);
+    const dynamicMinConfidence = riskManager.getDynamicMinConfidence({
+      eventVolatilityPct: volatilitySummary.eventVolatilityPct,
+    });
 
     emitEvent('scheduler', 'ai_decision', {
       event: event.title,
@@ -546,6 +537,7 @@ async function processEvent(prepared) {
 
     // Re-check slot availability
     if (getActiveBetCount() >= config.maxActiveBets) {
+      incrementMetric('gate_rejection', 1, { source: 'capacity', reason: 'slots_full' });
       log.info(`  Slots full — skipping remaining bets for "${event.title?.slice(0, 50)}"`);
       result.reasoning = 'Slots filled';
       results.push(result);
@@ -555,6 +547,7 @@ async function processEvent(prepared) {
     // Resolve which token to buy based on side
     const targetOutcome = matchOutcome(bet.predictedOutcome, event.outcomes);
     if (!targetOutcome) {
+      incrementMetric('gate_rejection', 1, { source: 'outcome_match', reason: 'outcome_mismatch' });
       log.warn(`  Could not match "${bet.predictedOutcome}" to available outcomes`);
       log.debug(`  Available: ${event.outcomes.map(o => `${o.outcome}${o.label ? ` [${o.label}]` : ''}`).join(', ')}`);
       appendDailyLog(`SKIP: "${event.title?.slice(0, 40)}" — outcome mismatch "${bet.predictedOutcome}"`);
@@ -565,6 +558,7 @@ async function processEvent(prepared) {
     // Determine token and price based on YES/NO side
     const side = (bet.side || 'YES').toUpperCase();
     if (side !== 'YES') {
+      incrementMetric('gate_rejection', 1, { source: 'strategy', reason: 'non_yes_side' });
       log.info(`  Skipping non-YES AI side "${side}" for "${bet.predictedOutcome}" (YES-only strategy)`);
       appendDailyLog(`SKIP: "${event.title?.slice(0, 40)}" — non-YES side proposed (${side})`);
       result.reasoning = 'Only YES-side bets are allowed';
@@ -582,9 +576,41 @@ async function processEvent(prepared) {
     }
 
     if (!tokenId) {
+      incrementMetric('gate_rejection', 1, { source: 'outcome_match', reason: 'missing_token_id' });
       log.warn(`  No ${side} tokenId for "${bet.predictedOutcome}"`);
       results.push(result);
       continue;
+    }
+
+    const runValidator = shouldRunAiValidator({
+      enabled: config.aiValidatorEnabled,
+      confidence: Number(bet.confidence || 0),
+      edge: Number(bet.edge || 0),
+      confidenceMax: config.aiValidatorConfidenceMax,
+      edgeMax: config.aiValidatorEdgeMax,
+    });
+
+    if (runValidator) {
+      const validation = await validateWeatherBetCandidate({
+        event,
+        weatherText: prepared.weatherText,
+        candidate: bet,
+      });
+      if (!validation.agrees) {
+        const reason = `AI validator rejected candidate: ${validation.reasoning || 'no reason provided'}`;
+        incrementMetric('gate_rejection', 1, { source: 'ai_validator', reason: 'validator_disagree' });
+        recordAuditEvent('ai_validator_rejection', {
+          eventId: event.eventId,
+          eventTitle: event.title,
+          predictedOutcome: bet.predictedOutcome,
+          reasoning: validation.reasoning || '',
+        }, 'scheduler');
+        log.info(`  ${reason}`);
+        appendDailyLog(`SKIP: "${event.title?.slice(0, 40)}" — ${reason}`);
+        result.reasoning = reason;
+        results.push(result);
+        continue;
+      }
     }
 
     log.debug(`  Matched: "${bet.predictedOutcome}" ${side} -> tokenId=${tokenId?.slice(0, 12)}... snapshotPrice=${betPrice}`);
@@ -594,6 +620,7 @@ async function processEvent(prepared) {
     const aiSnapshotPrice = Number(betPrice);
     const repricedAfterAi = await getCurrentEntryPrice(tokenId);
     if (!Number.isFinite(repricedAfterAi) || repricedAfterAi <= 0) {
+      incrementMetric('gate_rejection', 1, { source: 'market_data', reason: 'missing_live_entry_quote' });
       log.info(`  Live entry quote unavailable — skipping (${bet.predictedOutcome} ${side})`);
       appendDailyLog(`SKIP: "${event.title?.slice(0, 40)}" — no live entry quote (${bet.predictedOutcome} ${side})`);
       result.reasoning = 'Live entry quote unavailable';
@@ -603,11 +630,64 @@ async function processEvent(prepared) {
     betPrice = repricedAfterAi;
     log.info(`  Live repricing after AI: snapshot=${Number.isFinite(aiSnapshotPrice) ? aiSnapshotPrice.toFixed(3) : 'n/a'} -> current=${betPrice.toFixed(3)}`);
 
+    const boundaryGuard = evaluateBoundaryNoTrade({
+      weatherText: prepared.weatherText,
+      predictedOutcome: bet.predictedOutcome,
+      bandDegrees: config.boundaryNoTradeBandDeg,
+      confidence: Number(bet.confidence || 0),
+      edge: Number(bet.edge || 0),
+      overrideConfidence: config.boundaryOverrideConfidence,
+      overrideEdge: config.boundaryOverrideEdge,
+    });
+    if (boundaryGuard.blocked) {
+      const reason = `Boundary no-trade guard: temp ${boundaryGuard.nearestTempC?.toFixed(2)}C near boundary ${boundaryGuard.nearestBoundaryC?.toFixed(2)}C (distance ${boundaryGuard.distanceC?.toFixed(2)}C)`;
+      incrementMetric('gate_rejection', 1, { source: 'boundary_guard', reason: 'near_threshold' });
+      recordAuditEvent('boundary_guard_rejection', {
+        eventId: event.eventId,
+        eventTitle: event.title,
+        predictedOutcome: bet.predictedOutcome,
+        nearestTempC: boundaryGuard.nearestTempC,
+        nearestBoundaryC: boundaryGuard.nearestBoundaryC,
+        distanceC: boundaryGuard.distanceC,
+      }, 'scheduler');
+      log.info(`  ${reason}`);
+      appendDailyLog(`SKIP: "${event.title?.slice(0, 40)}" — ${reason}`);
+      result.reasoning = reason;
+      results.push(result);
+      continue;
+    }
+
     // Never add to an existing open position for the same unique outcome token
     if (hasOpenBetForToken(tokenId)) {
+      incrementMetric('gate_rejection', 1, { source: 'duplication', reason: 'token_already_open' });
       log.info(`  Open position already exists for token — skipping (${bet.predictedOutcome} ${side})`);
       appendDailyLog(`SKIP: "${event.title?.slice(0, 40)}" — token already open (${bet.predictedOutcome} ${side})`);
       result.reasoning = 'Open position already exists for this token';
+      results.push(result);
+      continue;
+    }
+
+    const inFlightEntryIntents = getOpenEntryIntents(500);
+    const eventExposure = getEventExposureSnapshot({
+      eventId: event.eventId,
+      eventTokenIds: (event.outcomes || []).map((o) => o?.tokenId).filter(Boolean),
+      inFlightIntents: inFlightEntryIntents,
+    });
+    if (eventExposure.hasExposure) {
+      incrementMetric('gate_rejection', 1, { source: 'event_exposure', reason: 'already_exposed_pre_submit' });
+      const reason = `Event exposure already active (${eventExposure.reasons.join(', ')})`;
+      appendDailyLog(`SKIP: "${event.title?.slice(0, 40)}" — ${reason}`);
+      result.reasoning = reason;
+      results.push(result);
+      continue;
+    }
+
+    const uniqueExposureCount = getDailyUniqueExposureCount({ inFlightIntents: inFlightEntryIntents });
+    const uniqueBudget = riskManager.checkUniqueDailyExposureBudget(uniqueExposureCount);
+    if (!uniqueBudget.allowed) {
+      incrementMetric('gate_rejection', 1, { source: 'unique_exposure_budget', reason: 'daily_budget_reached_pre_submit' });
+      appendDailyLog(`SKIP: "${event.title?.slice(0, 40)}" — ${uniqueBudget.reason}`);
+      result.reasoning = uniqueBudget.reason;
       results.push(result);
       continue;
     }
@@ -617,8 +697,18 @@ async function processEvent(prepared) {
       category: event.category,
       confidence: Number(bet.confidence || 0),
       edge: Number(bet.edge || 0),
+    }, {
+      minConfidenceOverride: dynamicMinConfidence,
     });
     if (!decisionGate.allowed) {
+      incrementMetric('gate_rejection', 1, { source: 'risk_gate', reason: decisionGate.reason || 'blocked' });
+      recordAuditEvent('risk_gate_rejection', {
+        eventId: event.eventId,
+        eventTitle: event.title,
+        reason: decisionGate.reason,
+        volatilityPct: volatilitySummary.eventVolatilityPct,
+        dynamicMinConfidence,
+      }, 'scheduler');
       log.info(`  Risk gate blocked: ${decisionGate.reason}`);
       appendDailyLog(`SKIP: "${event.title?.slice(0, 40)}" — ${decisionGate.reason}`);
       result.reasoning = decisionGate.reason;
@@ -629,6 +719,7 @@ async function processEvent(prepared) {
     // Validate odds
     const oddsCheck = riskManager.validateOdds(betPrice);
     if (!oddsCheck.valid) {
+      incrementMetric('gate_rejection', 1, { source: 'odds_gate', reason: oddsCheck.reason || 'invalid_odds' });
       log.info(`  Odds validation failed: ${oddsCheck.reason}`);
       appendDailyLog(`SKIP: "${event.title?.slice(0, 40)}" — ${oddsCheck.reason}`);
       results.push(result);
@@ -639,6 +730,7 @@ async function processEvent(prepared) {
     // fast moves between decision gate and execution.
     const preOrderPrice = await getCurrentEntryPrice(tokenId);
     if (!Number.isFinite(preOrderPrice) || preOrderPrice <= 0) {
+      incrementMetric('gate_rejection', 1, { source: 'market_data', reason: 'missing_preorder_quote' });
       log.info(`  Pre-order live quote unavailable — skipping (${bet.predictedOutcome} ${side})`);
       appendDailyLog(`SKIP: "${event.title?.slice(0, 40)}" — pre-order quote unavailable (${bet.predictedOutcome} ${side})`);
       result.reasoning = 'Pre-order live quote unavailable';
@@ -652,9 +744,86 @@ async function processEvent(prepared) {
 
     const preOrderOddsCheck = riskManager.validateOdds(betPrice);
     if (!preOrderOddsCheck.valid) {
+      incrementMetric('gate_rejection', 1, { source: 'odds_gate', reason: preOrderOddsCheck.reason || 'invalid_preorder_odds' });
       log.info(`  Pre-order odds validation failed: ${preOrderOddsCheck.reason}`);
       appendDailyLog(`SKIP: "${event.title?.slice(0, 40)}" — ${preOrderOddsCheck.reason} (pre-order)`);
       result.reasoning = preOrderOddsCheck.reason;
+      results.push(result);
+      continue;
+    }
+
+    const liquidity = await getLiquidityQuality(tokenId, {
+      freshMs: config.liquidityFreshMs,
+      maxSpreadPct: config.liquidityMaxSpreadPct,
+    });
+    if (!liquidity.ok || Number(liquidity.score || 0) < Number(config.liquidityMinScore || 55)) {
+      const reason = `Liquidity score too low: ${Number(liquidity.score || 0).toFixed(1)} < ${Number(config.liquidityMinScore || 55).toFixed(1)}`;
+      incrementMetric('gate_rejection', 1, { source: 'liquidity_gate', reason: 'low_liquidity' });
+      recordAuditEvent('liquidity_gate_rejection', {
+        eventId: event.eventId,
+        eventTitle: event.title,
+        tokenId,
+        score: liquidity.score,
+        threshold: config.liquidityMinScore,
+        spreadPct: liquidity.spreadPct,
+        depthShares: liquidity.depthShares,
+      }, 'scheduler');
+      appendDailyLog(`SKIP: "${event.title?.slice(0, 40)}" — ${reason}`);
+      result.reasoning = reason;
+      results.push(result);
+      continue;
+    }
+
+    const mode = getTradingMode();
+    if (!isExecutionEnabled(mode)) {
+      incrementMetric('gate_rejection', 1, { source: 'trading_mode', reason: mode });
+      result.reasoning = mode === 'shadow'
+        ? 'Shadow mode: analyzed but not executed'
+        : 'Trading mode off: execution disabled';
+      appendDailyLog(`SKIP: "${event.title?.slice(0, 40)}" — ${result.reasoning}`);
+      results.push(result);
+      continue;
+    }
+
+    const executionScope = `${String(event.eventId || 'unknown')}::${String(tokenId || '').slice(0, 16)}`;
+    const breakerCheck = canExecuteInScope(executionScope);
+    if (!breakerCheck.allowed) {
+      incrementMetric('gate_rejection', 1, { source: 'circuit_breaker', reason: 'breaker_open' });
+      const untilIso = breakerCheck.openUntilMs ? new Date(breakerCheck.openUntilMs).toISOString() : 'n/a';
+      const reason = `Circuit breaker open for scope ${executionScope} until ${untilIso}`;
+      log.warn(`  ${reason}`);
+      appendDailyLog(`SKIP: "${event.title?.slice(0, 40)}" — ${reason}`);
+      result.reasoning = reason;
+      results.push(result);
+      continue;
+    }
+
+    const executionKey = buildExecutionKey({
+      kind: 'entry',
+      eventId: event.eventId,
+      tokenId,
+      action: 'buy',
+      side,
+      suffix: 'v1',
+    });
+    const started = beginExecution({
+      key: executionKey,
+      kind: 'entry',
+      scope: executionScope,
+      payload: {
+        eventTitle: event.title,
+        predictedOutcome: bet.predictedOutcome,
+        price: betPrice,
+        tokenId,
+        eventId: event.eventId,
+      },
+    });
+    if (!started.ok) {
+      incrementMetric('gate_rejection', 1, { source: 'idempotency', reason: started.reason || 'already_started' });
+      result.reasoning = started.reason === 'terminal_duplicate'
+        ? 'Duplicate submission avoided (terminal execution already recorded)'
+        : 'Duplicate submission avoided (execution already in progress)';
+      log.info(`  ${result.reasoning}: ${executionKey}`);
       results.push(result);
       continue;
     }
@@ -675,15 +844,85 @@ async function processEvent(prepared) {
     }
     log.debug(`  Placing bet (${sharesToBuy} shares) on "${targetOutcome.outcome}" ${side} at price ${betPrice} (est. $${estimatedAmountUsd})...`);
 
-    const betResult = await placeBet({
+    let betResult;
+    incrementMetric('order_attempt', 1, { side, category: event.category || 'general' });
+    recordAuditEvent('order_attempt', {
+      executionKey,
+      eventId: event.eventId,
+      eventTitle: event.title,
       tokenId,
-      price: betPrice,
-      negRisk: targetOutcome.negRisk,
-      tickSize: targetOutcome.tickSize,
-      shares: requestedShares,
-    });
+      predictedOutcome: bet.predictedOutcome,
+      side,
+      expectedPrice: betPrice,
+      expectedShares: sharesToBuy,
+      volatilityPct: volatilitySummary.eventVolatilityPct,
+      dynamicMinConfidence,
+      liquidityScore: liquidity.score,
+    }, 'scheduler');
+    try {
+      betResult = await placeBet({
+        tokenId,
+        price: betPrice,
+        negRisk: targetOutcome.negRisk,
+        tickSize: targetOutcome.tickSize,
+        shares: requestedShares,
+      });
+    } catch (placeErr) {
+      markExecutionFailed(executionKey, placeErr.message, { stage: 'submit_exception' });
+      recordExecutionFailure(executionScope, placeErr.message);
+      recordIncident('order_submit_exception', {
+        executionKey,
+        scope: executionScope,
+        error: placeErr.message,
+      });
+      betResult = {
+        success: false,
+        status: 'error',
+        error: placeErr.message,
+      };
+    }
 
     if (betResult.success) {
+      markExecutionSubmitted(executionKey, {
+        orderId: betResult.orderId,
+        status: betResult.status,
+        paperTrade: !!betResult.paperTrade,
+        tokenId,
+        expectedPrice: betPrice,
+        expectedShares: betResult.shares || sharesToBuy,
+        sharesRequested: sharesToBuy,
+      });
+
+      const statusText = String(betResult.status || '').toLowerCase();
+      if (statusText.includes('partial')) {
+        markExecutionPartialFill(executionKey, {
+          orderId: betResult.orderId,
+          sharesRequested: sharesToBuy,
+          sharesReported: betResult.shares,
+        });
+        recordIncident('partial_fill', {
+          executionKey,
+          scope: executionScope,
+          orderId: betResult.orderId,
+          eventTitle: event.title,
+        });
+      }
+
+      markExecutionFilled(executionKey, {
+        orderId: betResult.orderId,
+        status: betResult.status,
+      });
+      recordExecutionSuccess(executionScope);
+      incrementMetric('fill', 1, { source: 'entry', paperTrade: !!betResult.paperTrade });
+      recordAuditEvent('order_result', {
+        executionKey,
+        eventId: event.eventId,
+        status: 'filled',
+        orderId: betResult.orderId,
+        shares: betResult.shares || sharesToBuy,
+        amountUsd: betResult.amountUsd ?? estimatedAmountUsd,
+      }, 'scheduler');
+
       const betId = recordBet({
         eventId: event.eventId,
         marketId: targetOutcome.marketId,
@@ -750,6 +989,12 @@ async function processEvent(prepared) {
 
       syncRealtimeSubscriptions().catch(() => {});
     } else {
+      markExecutionFailed(executionKey, betResult.error || 'order_rejected', {
+        stage: 'submit_response',
+        status: betResult.status,
+      });
+      recordExecutionFailure(executionScope, betResult.error || 'order_rejected');
+      incrementMetric('api_error', 1, { source: 'order_submit', reason: betResult.error || 'order_rejected' });
       log.error(`  BET FAILED: ${betResult.error}`);
       appendDailyLog(`FAILED: "${event.title?.slice(0, 40)}" — ${betResult.error}`);
       notify.error({ context: `Bet: ${event.title?.slice(0, 40)}`, error: betResult.error }).catch(() => {});
@@ -827,14 +1072,11 @@ export async function dailyReport() {
 
 async function runBetStatusCheck({ forceRefresh = false, reason = 'scheduled' } = {}) {
   if (!state.initialized) return;
-  if (state.statusTickRunning) {
-    state.statusTickPending = true;
-    state.statusTickPendingForceRefresh = state.statusTickPendingForceRefresh || !!forceRefresh;
-    state.statusTickPendingReasons.add(String(reason || 'queued'));
-    state.statusTickQueuedCount += 1;
+  const queue = requestStatusTick(state, { forceRefresh, reason });
+  if (!queue.runNow) {
     return;
   }
-  state.statusTickRunning = true;
+  const startedAtMs = Date.now();
 
   try {
     await refreshExchangeState({ force: forceRefresh });
@@ -920,6 +1162,8 @@ async function runBetStatusCheck({ forceRefresh = false, reason = 'scheduled' } 
       );
     }
 
+    reconcileExpectedFills({ openOrders: polyOrders, activeBets: dbBets });
+
     for (const a of actions) {
       if (a.action === 'hold') continue;
       const bet = dbBets.find((b) => b.id === a.betId);
@@ -937,33 +1181,20 @@ async function runBetStatusCheck({ forceRefresh = false, reason = 'scheduled' } 
 
     await syncRealtimeSubscriptions().catch(() => {});
   } catch (err) {
+    incrementMetric('api_error', 1, { source: 'status_check', reason: err.message || 'unknown_error' });
     logDetailedError(log, `Bet status check failed (${reason})`, err);
     notify.error({ context: `Bet status check (${reason})`, error: err.message }).catch(() => {});
   } finally {
-    state.statusTickRunning = false;
+    recordLatencySample('status_check', Date.now() - startedAtMs, true, { reason });
+    const replay = finishStatusTick(state);
+    if (!replay) return;
 
-    if (state.statusTickPending) {
-      const queuedForceRefresh = state.statusTickPendingForceRefresh;
-      const queuedReasons = Array.from(state.statusTickPendingReasons);
-      const queuedCount = state.statusTickQueuedCount;
-
-      state.statusTickPending = false;
-      state.statusTickPendingForceRefresh = false;
-      state.statusTickPendingReasons.clear();
-      state.statusTickQueuedCount = 0;
-
-      const queuedReason = queuedReasons.length > 0
-        ? `queued:${queuedReasons.join(',')}`
-        : 'queued:realtime';
-
-      log.info(`Replaying queued status check: queued_realtime_checks=${queuedCount || 1} reason=${queuedReason}`);
-
-      queueMicrotask(() => {
-        runBetStatusCheck({ forceRefresh: queuedForceRefresh, reason: queuedReason }).catch((err) => {
-          log.warn(`Queued status check failed: ${err.message}`);
-        });
+    log.info(`Replaying queued status check: queued_realtime_checks=${replay.queuedCount} reason=${replay.reason}`);
+    queueMicrotask(() => {
+      runBetStatusCheck({ forceRefresh: replay.forceRefresh, reason: replay.reason }).catch((err) => {
+        log.warn(`Queued status check failed: ${err.message}`);
       });
-    }
+    });
   }
 }
 
@@ -986,18 +1217,18 @@ export function startScheduler() {
 
   // Daily report — 23:50 UTC
   cronJobs.push(new CronJob(
-    '50 23 * * *',
+    config.dailyReportCron,
     async () => {
       if (!state.initialized) return;
       await dailyReport();
     },
     null, true, 'UTC',
   ));
-  log.info('Scheduled daily report: 23:50 UTC');
+  log.info(`Scheduled daily report: ${config.dailyReportCron} (UTC)`);
 
   // Stale open-order cancellation — every minute
   cronJobs.push(new CronJob(
-    '* * * * *',
+    config.staleOrderCancelCron,
     async () => {
       if (!state.initialized) return;
       if (state.staleCancelRunning) return;
@@ -1018,17 +1249,17 @@ export function startScheduler() {
     },
     null, true, 'UTC',
   ));
-  log.info(`Scheduled stale-order cancellation: every 1min (>${ORDER_CANCEL_STALE_MINUTES}m unfilled)`);
+  log.info(`Scheduled stale-order cancellation: ${config.staleOrderCancelCron} (>${ORDER_CANCEL_STALE_MINUTES}m unfilled)`);
 
   // Bet status fallback check — realtime WebSocket monitor handles primary triggers.
   cronJobs.push(new CronJob(
-    STATUS_FALLBACK_CRON,
+    config.statusFallbackCron,
     async () => {
       await runBetStatusCheck({ forceRefresh: true, reason: 'fallback_cron' });
     },
     null, true, 'UTC',
   ));
-  log.info(`Scheduled fallback bet status check: ${STATUS_FALLBACK_CRON}`);
+  log.info(`Scheduled fallback bet status check: ${config.statusFallbackCron}`);
 
   // Initialize
   (async () => {

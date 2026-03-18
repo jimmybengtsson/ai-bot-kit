@@ -6,6 +6,7 @@ import { createLogger, logDetailedError } from '../logger.js';
 import { getClobClient } from '../wallet.js';
 import { fetchMarketMetaByTokenId } from './gamma.js';
 import { retryWithBackoff, shouldRetryNetworkError } from '../retry.js';
+import { makeRuntimeId } from '../utils/runtimeId.js';
 
 const log = createLogger('clob');
 
@@ -57,7 +58,7 @@ function setSellCooldown(tokenId, ms) {
   sellCooldownUntilByToken.set(tokenId, Date.now() + ms);
 }
 
-export function isSellCoolingDown(tokenId) {
+function isSellCoolingDown(tokenId) {
   return hasSellCooldown(tokenId);
 }
 
@@ -228,6 +229,145 @@ function toTick(value, tickSize, mode = 'nearest') {
   return Math.round(scaled) * tick;
 }
 
+function toFiniteNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function sumTopDepth(levels, maxLevels = 3) {
+  if (!Array.isArray(levels) || levels.length === 0) return 0;
+  let total = 0;
+  for (const level of levels.slice(0, maxLevels)) {
+    const size = toFiniteNumber(level?.size ?? level?.amount ?? level?.qty ?? level?.quantity ?? level?.[1]);
+    if (Number.isFinite(size) && size > 0) total += size;
+  }
+  return total;
+}
+
+export function scoreLiquidityQualitySnapshot(snapshot = {}, {
+  maxSpreadPct = 0.08,
+  freshMs = 90_000,
+  targetDepthShares = 400,
+} = {}) {
+  const bid = toFiniteNumber(snapshot?.bestBid);
+  const ask = toFiniteNumber(snapshot?.bestAsk);
+  if (!Number.isFinite(bid) || !Number.isFinite(ask) || bid <= 0 || ask <= 0 || ask < bid) {
+    return {
+      ok: false,
+      score: 0,
+      reason: 'missing_top_of_book',
+      spreadPct: null,
+      bestBid: bid,
+      bestAsk: ask,
+      depthShares: 0,
+      freshnessMs: null,
+    };
+  }
+
+  const mid = (bid + ask) / 2;
+  const spreadPct = mid > 0 ? (ask - bid) / mid : 1;
+  const boundedSpreadTarget = Math.max(0.005, Number(maxSpreadPct || 0.08));
+  const spreadScore = Math.max(0, Math.min(1, 1 - (spreadPct / boundedSpreadTarget))) * 60;
+
+  const bidsDepth = sumTopDepth(snapshot?.bids);
+  const asksDepth = sumTopDepth(snapshot?.asks);
+  const depthShares = bidsDepth + asksDepth;
+  const depthTarget = Math.max(50, Number(targetDepthShares || 400));
+  const depthScore = Math.max(0, Math.min(1, depthShares / depthTarget)) * 30;
+
+  const observedAtMs = toFiniteNumber(snapshot?.observedAtMs) || Date.now();
+  const freshnessMs = Math.max(0, Date.now() - observedAtMs);
+  const freshnessTarget = Math.max(1000, Number(freshMs || 90_000));
+  const freshnessScore = Math.max(0, Math.min(1, 1 - (freshnessMs / freshnessTarget))) * 10;
+
+  const score = Number((spreadScore + depthScore + freshnessScore).toFixed(2));
+  const ok = score > 0;
+  return {
+    ok,
+    score,
+    reason: ok ? 'ok' : 'insufficient_liquidity',
+    spreadPct,
+    bestBid: bid,
+    bestAsk: ask,
+    depthShares,
+    freshnessMs,
+  };
+}
+
+async function fetchOrderBookSnapshot(client, tokenId) {
+  const candidates = [
+    () => (typeof client.getOrderBook === 'function' ? client.getOrderBook(tokenId) : null),
+    () => (typeof client.getBook === 'function' ? client.getBook(tokenId) : null),
+  ];
+
+  for (const fn of candidates) {
+    try {
+      const data = await fn();
+      if (!data) continue;
+      return {
+        bids: Array.isArray(data?.bids) ? data.bids : [],
+        asks: Array.isArray(data?.asks) ? data.asks : [],
+        observedAtMs: Date.now(),
+      };
+    } catch {
+      // Try alternate SDK method.
+    }
+  }
+
+  return {
+    bids: [],
+    asks: [],
+    observedAtMs: Date.now(),
+  };
+}
+
+export async function getLiquidityQuality(tokenId, options = {}) {
+  if (!tokenId) {
+    return {
+      ok: false,
+      score: 0,
+      reason: 'missing_token_id',
+      spreadPct: null,
+      bestBid: null,
+      bestAsk: null,
+      depthShares: 0,
+      freshnessMs: null,
+    };
+  }
+
+  try {
+    const client = await getClobClient();
+    const [book, buyQuote, sellQuote] = await Promise.all([
+      fetchOrderBookSnapshot(client, tokenId),
+      getLatestExecutablePrice(client, tokenId, 'BUY').catch(() => null),
+      getLatestExecutablePrice(client, tokenId, 'SELL').catch(() => null),
+    ]);
+
+    const bestBid = Number.isFinite(sellQuote) ? sellQuote : null;
+    const bestAsk = Number.isFinite(buyQuote) ? buyQuote : null;
+    const snapshot = {
+      ...book,
+      bestBid,
+      bestAsk,
+      observedAtMs: Date.now(),
+    };
+
+    return scoreLiquidityQualitySnapshot(snapshot, options);
+  } catch (err) {
+    log.warn(`Liquidity quality fetch failed for ${String(tokenId).slice(0, 12)}: ${err.message}`);
+    return {
+      ok: false,
+      score: 0,
+      reason: 'liquidity_fetch_error',
+      spreadPct: null,
+      bestBid: null,
+      bestAsk: null,
+      depthShares: 0,
+      freshnessMs: null,
+    };
+  }
+}
+
 function extractOrderError(responseLike) {
   return responseLike?.errorMsg || responseLike?.error || responseLike?.message || 'Unknown order error';
 }
@@ -269,7 +409,7 @@ export async function placeBet({ tokenId, price, negRisk = false, tickSize = '0.
     log.info(`[PAPER TRADE] Simulated bet: $${amountUsd} for ${shares} share(s) at price ${price}`);
     return {
       success: true,
-      orderId: `paper_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      orderId: makeRuntimeId('paper'),
       status: 'matched',
       paperTrade: true,
       amountUsd,
@@ -464,7 +604,7 @@ export async function sellShares({ tokenId, price, shares = 1, negRisk = false, 
     log.info(`[PAPER TRADE] Simulated sell: ${shares} shares @ ${price} = $${payout.toFixed(4)}`);
     return {
       success: true,
-      orderId: `paper_sell_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      orderId: makeRuntimeId('paper_sell'),
       status: 'matched',
       paperTrade: true,
       payout,

@@ -1,0 +1,55 @@
+{
+  "updatedAt": "2026-03-18T12:43:17.456Z",
+  "records": [
+    {
+      "key": "entry:event-1:token-1:buy:YES",
+      "kind": "entry",
+      "scope": "event-1::token-1",
+      "payload": {
+        "price": 0.45,
+        "shares": 2
+      },
+      "state": "completed",
+      "attempts": 1,
+      "createdAt": "2026-03-18T12:43:17.450Z",
+      "updatedAt": "2026-03-18T12:43:17.456Z",
+      "terminal": true,
+      "orderId": "order-1",
+      "error": null,
+      "submitMeta": {
+        "orderId": "order-1",
+        "status": "submitted",
+        "tokenId": "token-1",
+        "expectedPrice": 0.45,
+        "expectedShares": 2
+      },
+      "fillMeta": {
+        "orderId": "order-1",
+        "status": "filled",
+        "at": "2026-03-18T12:43:17.456Z"
+      },
+      "completedReason": "filled"
+    }
+  ],
+  "breakers": [],
+  "expectedFills": [
+    {
+      "key": "entry:event-1:token-1:buy:YES",
+      "orderId": "order-1",
+      "kind": "entry",
+      "scope": "event-1::token-1",
+      "tokenId": "token-1",
+      "expectedPrice": 0.45,
+      "expectedShares": 2,
+      "submittedAt": "2026-03-18T12:43:17.455Z",
+      "staleAfterMs": 180000,
+      "state": "observed_filled",
+      "observedPrice": null,
+      "observedShares": null,
+      "mismatchReason": null,
+      "updatedAt": "2026-03-18T12:43:17.456Z"
+    }
+  ],
+  "incidents": [],
+  "reconciliations": []
+}

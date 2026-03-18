@@ -1,0 +1,30 @@
+{
+  "updatedAt": "2026-03-18T12:43:17.456Z",
+  "events": [
+    {
+      "id": "audit_1773837797455_0rhlh3",
+      "at": "2026-03-18T12:43:17.455Z",
+      "type": "order_submit",
+      "source": "executionStore",
+      "payload": {
+        "key": "entry:event-1:token-1:buy:YES",
+        "orderId": "order-1",
+        "tokenId": "token-1",
+        "expectedPrice": 0.45,
+        "expectedShares": 2
+      }
+    },
+    {
+      "id": "audit_1773837797456_7c909b",
+      "at": "2026-03-18T12:43:17.456Z",
+      "type": "fill",
+      "source": "executionStore",
+      "payload": {
+        "key": "entry:event-1:token-1:buy:YES",
+        "orderId": "order-1",
+        "status": "filled"
+      }
+    }
+  ],
+  "reconciliations": []
+}

@@ -36,6 +36,63 @@ function normalizeMarketQuestion(market) {
   return null;
 }
 
+function parseArrayMaybe(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+function parseClosedFlag(value) {
+  if (value === true || value === false) return value;
+  const text = String(value ?? '').trim().toLowerCase();
+  if (text === 'true' || text === '1' || text === 'yes') return true;
+  if (text === 'false' || text === '0' || text === 'no') return false;
+  return null;
+}
+
+function parseDateMs(value) {
+  if (!value) return null;
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value > 1e12 ? value : value * 1000;
+  }
+  const n = Number(value);
+  if (Number.isFinite(n)) return n > 1e12 ? n : n * 1000;
+  const ts = new Date(String(value)).getTime();
+  if (Number.isFinite(ts)) return ts;
+  const tsZ = new Date(`${String(value)}Z`).getTime();
+  return Number.isFinite(tsZ) ? tsZ : null;
+}
+
+export function extractTokenResolutionFromMarket(market, tokenId) {
+  const token = String(tokenId || '').trim();
+  if (!token || !market || typeof market !== 'object') return null;
+
+  const clobTokenIds = parseArrayMaybe(market.clobTokenIds || market.clob_token_ids);
+  const outcomePrices = parseArrayMaybe(market.outcomePrices || market.outcome_prices);
+  const idx = clobTokenIds.findIndex((t) => String(t || '').trim() === token);
+  if (idx < 0) return null;
+
+  const closed = parseClosedFlag(market.closed ?? market.is_closed ?? market.market_closed);
+  const terminalPriceRaw = Number(outcomePrices[idx]);
+  const terminalPrice = Number.isFinite(terminalPriceRaw) ? terminalPriceRaw : null;
+  const closedAtMs = parseDateMs(market.closedTime ?? market.closed_time ?? market.endDate ?? market.end_date);
+
+  return {
+    found: true,
+    closed,
+    closedAtMs,
+    terminalPrice,
+    marketId: String(market.id || market.market_id || market.conditionId || market.condition_id || ''),
+  };
+}
+
 function sameText(a, b) {
   return String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
 }
@@ -222,6 +279,58 @@ export async function fetchMarketMetaByTokenId(tokenId) {
   };
   setCachedGamma(cacheKey, result);
   return result;
+}
+
+/**
+ * Fetch settlement state for a token from Gamma market metadata.
+ * Includes closed flag and token-side terminal outcome price when available.
+ * @param {string} tokenId
+ * @returns {Promise<{found:boolean, closed:boolean|null, closedAtMs:number|null, terminalPrice:number|null, marketId:string}|null>}
+ */
+export async function fetchTokenResolutionStateByTokenId(tokenId) {
+  if (!tokenId) return null;
+  const token = String(tokenId).trim();
+  const cacheKey = `market_resolution:${token}`;
+  const cached = getCachedGamma(cacheKey);
+  if (cached) return cached;
+
+  const urls = [];
+  const unfiltered = new URL(`${config.gammaHost}/markets`);
+  unfiltered.searchParams.set('limit', '1');
+  unfiltered.searchParams.set('clob_token_ids', token);
+  urls.push(unfiltered);
+
+  const closedOnly = new URL(`${config.gammaHost}/markets`);
+  closedOnly.searchParams.set('closed', 'true');
+  closedOnly.searchParams.set('limit', '1');
+  closedOnly.searchParams.set('clob_token_ids', token);
+  urls.push(closedOnly);
+
+  for (const url of urls) {
+    const rows = await retryWithBackoff(
+      async () => {
+        const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
+        if (!res.ok) throw new Error(`Gamma resolution-by-token ${res.status} ${res.statusText}`);
+        const data = await res.json();
+        return Array.isArray(data) ? data : [];
+      },
+      {
+        maxRetries: 2,
+        baseDelayMs: 900,
+        label: `Gamma resolution by token ${token.slice(0, 18)}`,
+        shouldRetry: shouldRetryNetworkError,
+      },
+    ).catch(() => []);
+
+    const market = rows[0];
+    const parsed = extractTokenResolutionFromMarket(market, token);
+    if (parsed) {
+      setCachedGamma(cacheKey, parsed);
+      return parsed;
+    }
+  }
+
+  return null;
 }
 
 /**

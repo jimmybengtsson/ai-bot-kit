@@ -224,6 +224,88 @@ const BETTING_DECISION_SCHEMA = {
   },
 };
 
+const BET_VALIDATION_SCHEMA = {
+  type: 'json_schema',
+  name: 'bet_validation',
+  strict: true,
+  schema: {
+    type: 'object',
+    properties: {
+      agrees: { type: 'boolean' },
+      reasoning: { type: 'string' },
+    },
+    required: ['agrees', 'reasoning'],
+    additionalProperties: false,
+  },
+};
+
+function buildValidationSystemPrompt() {
+  return `You are an independent validator for weather market trade candidates.
+
+Your job is to validate or reject ONE proposed YES-side outcome using only provided event and weather context.
+
+Rules:
+- Focus on highest temperature for full event day, not only the exact resolution timestamp.
+- Respect integer resolution precision from event descriptions.
+- Map decimal forecasts to whole degrees using nearest-integer rounding (.5 rounds up).
+- If boundary uncertainty is meaningful, reject the candidate.
+- Return concise reasoning.
+
+Respond only with valid JSON matching the schema.`;
+}
+
+function formatValidationPrompt({ event, weatherText, candidate }) {
+  const outcomes = (event?.outcomes || [])
+    .map((o) => `- ${o.outcome}${o.label ? ` [${o.label}]` : ''}`)
+    .join('\n');
+
+  return `VALIDATE THIS CANDIDATE
+Event: ${event?.title || 'Unknown'}
+Description: ${event?.description || 'N/A'}
+Location: ${event?.location || 'unknown'}
+Resolution: ${event?.endTime || 'unknown'}
+
+Candidate:
+- predictedOutcome: ${candidate?.predictedOutcome || ''}
+- confidence: ${candidate?.confidence ?? 'n/a'}
+- estimatedProbability: ${candidate?.estimatedProbability ?? 'n/a'}
+- edge: ${candidate?.edge ?? 'n/a'}
+- reasoning: ${candidate?.reasoning || ''}
+
+Available outcomes:
+${outcomes || '- none'}
+
+Weather context:
+${weatherText || 'N/A'}
+`;
+}
+
+async function runValidationRequest(userMessage) {
+  log.info(`OpenAI validation request: model=${config.openaiModel} prompt_chars=${userMessage.length}`);
+
+  const response = await retryWithBackoff(
+    () => client.responses.create({
+      model: config.openaiModel,
+      instructions: buildValidationSystemPrompt(),
+      input: userMessage,
+      text: { format: BET_VALIDATION_SCHEMA },
+      store: false,
+    }),
+    {
+      maxRetries: 2,
+      baseDelayMs: 1500,
+      label: 'AI validation request',
+      shouldRetry: (err) => {
+        const msg = (err.message || '').toLowerCase();
+        if (msg.includes('401') || msg.includes('invalid api key') || msg.includes('schema')) return false;
+        return true;
+      },
+    },
+  );
+
+  return response;
+}
+
 async function runAnalysisRequest(userMessage) {
   log.info(`OpenAI request: model=${config.openaiModel} prompt_chars=${userMessage.length}`);
 
@@ -422,5 +504,31 @@ ${activeBetsStr || 'None'}`;
       category: event?.category || null,
     });
     return { ...emptyResult, _tokenUsage: null };
+  }
+}
+
+export async function validateWeatherBetCandidate({ event, weatherText, candidate }) {
+  try {
+    const response = await runValidationRequest(formatValidationPrompt({ event, weatherText, candidate }));
+    const parsed = JSON.parse(response?.output_text || '{}');
+    const result = {
+      agrees: !!parsed?.agrees,
+      reasoning: String(parsed?.reasoning || ''),
+    };
+    emitEvent('ai', 'ai_validation', {
+      event: event?.title || '',
+      predictedOutcome: candidate?.predictedOutcome || '',
+      agrees: result.agrees,
+    });
+    return result;
+  } catch (err) {
+    logDetailedError(log, 'AI candidate validation failed', err, {
+      event: event?.title || null,
+      outcome: candidate?.predictedOutcome || null,
+    });
+    return {
+      agrees: false,
+      reasoning: `Validation failed: ${err.message}`,
+    };
   }
 }

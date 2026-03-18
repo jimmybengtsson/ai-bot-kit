@@ -14,15 +14,45 @@ class RiskManager {
     this.currentBalance = balance;
   }
 
-  checkBetAllowed(decision) {
+  getDynamicMinConfidence({ eventVolatilityPct = 0 } = {}) {
+    const base = Number(config.minConfidence ?? 60);
+    if (!config.volatilityConfidenceEnabled) return base;
+
+    const volatility = Number(eventVolatilityPct || 0);
+    const highThreshold = Number(config.volatilityHighPct || 18);
+    const lowThreshold = Number(config.volatilityLowPct || 8);
+
+    if (volatility >= highThreshold) {
+      return base + Number(config.volatilityConfidenceBumpHigh || 7);
+    }
+    if (volatility >= lowThreshold) {
+      return base + Number(config.volatilityConfidenceBumpLow || 3);
+    }
+    return base;
+  }
+
+  checkUniqueDailyExposureBudget(currentUniqueExposureCount) {
+    const limit = config.maxDailyUniqueExposures ?? config.maxDailyBets ?? 12;
+    const current = Number(currentUniqueExposureCount || 0);
+    if (current >= limit) {
+      return { allowed: false, reason: `Daily unique exposure budget reached (${current}/${limit})` };
+    }
+    return { allowed: true };
+  }
+
+  checkBetAllowed(decision, options = {}) {
     const activeCount = memory.getActiveBetCount();
     const maxActive = config.maxActiveBets ?? 5;
     if (activeCount >= maxActive) {
       return { allowed: false, reason: `Max active bets reached (${activeCount}/${maxActive})` };
     }
 
-    if (decision.confidence < (config.minConfidence ?? 60)) {
-      return { allowed: false, reason: `Confidence too low: ${decision.confidence}%` };
+    const minConfidence = Number(options.minConfidenceOverride ?? config.minConfidence ?? 60);
+    if (decision.confidence < minConfidence) {
+      return {
+        allowed: false,
+        reason: `Confidence too low: ${decision.confidence}% < required ${minConfidence.toFixed(0)}%`,
+      };
     }
 
     if ((decision.edge ?? 0) < (config.minEdge ?? 0.03)) {
@@ -87,6 +117,7 @@ class RiskManager {
       balance: this.currentBalance,
       lowBalance,
       todayBetsPlaced: Number(todayStats?.bets_placed || 0),
+      maxDailyUniqueExposures: Number(config.maxDailyUniqueExposures ?? config.maxDailyBets ?? 12),
       byCategory: counts,
     };
   }

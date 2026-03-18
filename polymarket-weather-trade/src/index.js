@@ -12,9 +12,64 @@ import { riskManager } from './skills/riskManager.js';
 import { registerCommands, startPolling, stopPolling, isTelegramConfigured } from './telegram.js';
 import { getCurrentExitPrice } from './skills/betExecutor.js';
 import { initSettingsStore, getPublicSettingsView, savePublicSettings, getSettingsFilePath } from './settingsStore.js';
+import { requireOpsAuth, hasOpsTokenConfigured } from './opsAuth.js';
+import { describeTradingMode, getTradingMode, parseAndValidateMode } from './tradingMode.js';
+import {
+  getCircuitBreakersSnapshot,
+  getExpectedFillsSnapshot,
+  getRecentExecutions,
+  getRecentIncidents,
+  getRecentReconciliation,
+} from './executionStore.js';
+import { getMetricsSnapshot, getSloSnapshot } from './telemetryStore.js';
+import { getAuditEvents, getReconciliationEvents } from './auditStore.js';
 
 const app = express();
 app.use(express.json());
+
+function sendApiError(res, status, code, message, details = undefined) {
+  return res.status(status).json({
+    error: {
+      code,
+      message,
+      ...(details ? { details } : {}),
+    },
+  });
+}
+
+function requirePublicReadOrOpsAuth(req, res, next) {
+  if (config.publicReadEndpointsEnabled) return next();
+  return requireOpsAuth(req, res, next);
+}
+
+function buildPrAGateSummary(metricsSnapshot) {
+  const counters = metricsSnapshot?.counters || {};
+  const events = Array.isArray(metricsSnapshot?.events) ? metricsSnapshot.events : [];
+
+  let aiValidatorRejects = 0;
+  let boundaryGuardRejects = 0;
+
+  for (const ev of events) {
+    if (ev?.name !== 'gate_rejection') continue;
+    const source = String(ev?.data?.source || '');
+    if (source === 'ai_validator') aiValidatorRejects += 1;
+    if (source === 'boundary_guard') boundaryGuardRejects += 1;
+  }
+
+  const totalGateRejections = Number(counters.gate_rejection || 0);
+  const totalPrAGateRejections = aiValidatorRejects + boundaryGuardRejects;
+  const prAShareOfGateRejectionsPct = totalGateRejections > 0
+    ? Number(((totalPrAGateRejections / totalGateRejections) * 100).toFixed(2))
+    : 0;
+
+  return {
+    aiValidatorRejects,
+    boundaryGuardRejects,
+    totalPrAGateRejections,
+    totalGateRejections,
+    prAShareOfGateRejectionsPct,
+  };
+}
 
 function resolveEntryPrice(bet) {
   const direct = Number(bet?.odds_at_bet);
@@ -96,13 +151,15 @@ app.get('/', (req, res) => {
     description: 'Autonomous weather betting bot on Polymarket using OpenWeatherMap data',
     wallet: getAddress(),
     paperTrade: config.paperTrade(),
+    tradingMode: getTradingMode(),
+    opsAuthEnabled: hasOpsTokenConfigured(),
     uptime: process.uptime(),
     lastScan: state.lastScan,
     lastBalance: state.lastBalance,
   });
 });
 
-app.get('/status', (req, res) => {
+app.get('/status', requirePublicReadOrOpsAuth, (req, res) => {
   res.type('html').send(`<!doctype html>
 <html>
 <head>
@@ -178,26 +235,61 @@ app.get('/status', (req, res) => {
 </html>`);
 });
 
-app.get('/status/stream', async (req, res) => {
+app.get('/status/stream', requirePublicReadOrOpsAuth, async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.write('retry: 3000\n');
   res.flushHeaders?.();
+
+  const typed = String(req.query.typed || '').toLowerCase() === 'true';
+  const heartbeatMs = Math.max(3000, Number(req.query.heartbeatMs || 15000));
+  let eventId = 0;
+
+  const sendEvent = (name, payload) => {
+    eventId += 1;
+    res.write(`id: ${eventId}\n`);
+    if (typed) res.write(`event: ${name}\n`);
+    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  };
 
   const sendSnapshot = async () => {
     const snap = await buildStatusSnapshot();
-    res.write(`data: ${JSON.stringify(snap)}\n\n`);
+    sendEvent('snapshot', snap);
   };
 
   await sendSnapshot().catch(() => {});
-  const timer = setInterval(() => {
+  const snapshotTimer = setInterval(() => {
     sendSnapshot().catch(() => {});
   }, 5000);
 
+  const heartbeatTimer = setInterval(() => {
+    sendEvent('heartbeat', { now: new Date().toISOString() });
+  }, heartbeatMs);
+
   req.on('close', () => {
-    clearInterval(timer);
+    clearInterval(snapshotTimer);
+    clearInterval(heartbeatTimer);
     res.end();
   });
+});
+
+app.get('/metrics', requireOpsAuth, (req, res) => {
+  const limit = parseInt(req.query.limit || '200', 10);
+  const day = req.query.day ? String(req.query.day) : null;
+  const snapshot = getMetricsSnapshot({ day, limit });
+  res.json({
+    ...snapshot,
+    summaries: {
+      prA: buildPrAGateSummary(snapshot),
+    },
+  });
+});
+
+app.get('/slo', requireOpsAuth, (req, res) => {
+  const windowHours = parseInt(req.query.windowHours || '24', 10);
+  res.json(getSloSnapshot({ windowHours }));
 });
 
 app.get('/settings', (req, res) => {
@@ -305,10 +397,11 @@ app.get('/settings', (req, res) => {
       const out = await res.json();
 
       if (!res.ok) {
-        const details = Array.isArray(out.fieldErrors) && out.fieldErrors.length
-          ? ' [' + out.fieldErrors.slice(0, 4).map((e) => e.name + ': ' + e.message).join(' | ') + ']'
+        const fieldErrors = out?.error?.details?.fieldErrors;
+        const details = Array.isArray(fieldErrors) && fieldErrors.length
+          ? ' [' + fieldErrors.slice(0, 4).map((e) => e.name + ': ' + e.message).join(' | ') + ']'
           : '';
-        document.getElementById('status').textContent = (out.error || 'Save failed') + details;
+        document.getElementById('status').textContent = (out?.error?.message || 'Save failed') + details;
         document.getElementById('status').className = 'warn';
         return;
       }
@@ -340,27 +433,41 @@ app.get('/settings/data', (req, res) => {
   });
 });
 
-app.post('/settings/data', (req, res) => {
+app.post('/settings/data', requireOpsAuth, (req, res) => {
   try {
     const values = req.body?.values;
     if (!values || typeof values !== 'object') {
-      return res.status(400).json({ error: 'Body must include { values: { KEY: value } }' });
+      return sendApiError(res, 400, 'INVALID_REQUEST', 'Body must include { values: { KEY: value } }');
     }
 
     const result = savePublicSettings(values);
     return res.json(result);
   } catch (err) {
     if (err?.code === 'VALIDATION_FAILED') {
-      return res.status(400).json({
-        error: 'One or more settings are invalid',
+      return sendApiError(res, 400, 'VALIDATION_FAILED', 'One or more settings are invalid', {
         fieldErrors: err.fieldErrors || [],
       });
     }
-    return res.status(500).json({ error: err.message });
+    return sendApiError(res, 500, 'INTERNAL_ERROR', err.message);
   }
 });
 
-app.get('/health', async (req, res) => {
+app.get('/health/live', requirePublicReadOrOpsAuth, async (req, res) => {
+  res.json({ ok: true, now: new Date().toISOString(), uptimeSec: process.uptime() });
+});
+
+app.get('/health/ready', requirePublicReadOrOpsAuth, async (req, res) => {
+  const health = await runHealthChecks();
+  const required = new Set(['polymarket_clob', 'wallet', 'balance', 'openai']);
+  const failedRequired = health.checks.filter((c) => required.has(c.name) && !c.ok);
+  const ready = failedRequired.length === 0;
+  res.status(ready ? 200 : 503).json({
+    ready,
+    failedRequired,
+  });
+});
+
+app.get('/health', requirePublicReadOrOpsAuth, async (req, res) => {
   const health = await runHealthChecks();
   res.status(health.healthy ? 200 : 503).json(health);
 });
@@ -408,21 +515,88 @@ app.get('/log/today', (req, res) => {
   res.type('text/plain').send(readDailyLog() || 'No entries today.');
 });
 
-app.all('/trigger/scan', async (req, res) => {
+app.all('/trigger/scan', requireOpsAuth, async (req, res) => {
   log.info(`Manual scan triggered via API (${req.method})`);
   await bettingLoop();
   res.json({ ok: true, message: 'Weather scan complete' });
 });
 
-app.post('/trigger/report', async (req, res) => {
+app.post('/trigger/report', requireOpsAuth, async (req, res) => {
   const report = await dailyReport();
   res.type('text/plain').send(report);
+});
+
+app.get('/trading-mode', (req, res) => {
+  const mode = getTradingMode();
+  res.json({
+    mode,
+    description: describeTradingMode(mode),
+    paperTrade: config.paperTrade(),
+  });
+});
+
+app.post('/trading-mode', requireOpsAuth, (req, res) => {
+  const parsed = parseAndValidateMode(req.body?.mode);
+  if (!parsed.valid) {
+    return sendApiError(res, 400, 'INVALID_MODE', parsed.error, { allowed: parsed.allowed });
+  }
+
+  const currentMode = getTradingMode();
+  if (parsed.mode === currentMode) {
+    return res.json({ ok: true, mode: parsed.mode, unchanged: true, description: describeTradingMode(parsed.mode) });
+  }
+
+  if (parsed.mode === 'live' && String(req.query.confirm || req.body?.confirm || '').toLowerCase() !== 'true') {
+    return sendApiError(res, 400, 'LIVE_CONFIRM_REQUIRED', 'Setting live mode requires explicit confirm=true');
+  }
+
+  const result = savePublicSettings({ TRADING_MODE: parsed.mode });
+  return res.json({
+    ok: true,
+    mode: parsed.mode,
+    description: describeTradingMode(parsed.mode),
+    changed: result.changed,
+  });
+});
+
+app.get('/ops/executions', requireOpsAuth, (req, res) => {
+  const limit = parseInt(req.query.limit || '100', 10);
+  res.json({ executions: getRecentExecutions(limit), count: Math.max(1, Math.min(2000, limit)) });
+});
+
+app.get('/ops/incidents', requireOpsAuth, (req, res) => {
+  const limit = parseInt(req.query.limit || '100', 10);
+  res.json({ incidents: getRecentIncidents(limit) });
+});
+
+app.get('/ops/audit', requireOpsAuth, (req, res) => {
+  const limit = parseInt(req.query.limit || '200', 10);
+  const type = req.query.type ? String(req.query.type) : null;
+  res.json({ events: getAuditEvents({ limit, type }) });
+});
+
+app.get('/ops/reconciliation', requireOpsAuth, (req, res) => {
+  const limit = parseInt(req.query.limit || '200', 10);
+  res.json({
+    records: getRecentReconciliation(limit),
+    durableRecords: getReconciliationEvents({ limit }),
+  });
+});
+
+app.get('/ops/expected-fills', requireOpsAuth, (req, res) => {
+  const limit = parseInt(req.query.limit || '200', 10);
+  res.json({ expectedFills: getExpectedFillsSnapshot(limit) });
+});
+
+app.get('/ops/circuit-breakers', requireOpsAuth, (req, res) => {
+  res.json({ breakers: getCircuitBreakersSnapshot() });
 });
 
 app.get('/config', (req, res) => {
   res.json({
     model: config.openaiModel,
     paperTrade: config.paperTrade(),
+    tradingMode: getTradingMode(),
     betAmount: config.betAmountUsd,
     maxActiveBets: config.maxActiveBets,
     minBalanceWarn: config.minBalanceWarn,

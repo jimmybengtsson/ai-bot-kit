@@ -3,6 +3,7 @@ import WebSocket from 'ws';
 import { config } from './config.js';
 import { createLogger } from './logger.js';
 import { getApiCreds } from './wallet.js';
+import { incrementMetric, recordMetricEvent } from './telemetryStore.js';
 
 const log = createLogger('realtime');
 
@@ -269,11 +270,14 @@ function attachCommonHandlers(channel, ws) {
   });
 
   ws.on('error', (err) => {
+    incrementMetric('api_error', 1, { source: `${channel}_ws`, reason: err.message || 'socket_error' });
     log.warn(`${channel} WS error: ${err.message}`);
   });
 
   ws.on('close', (code, reasonBuffer) => {
     const reason = String(reasonBuffer || '').trim();
+    incrementMetric('ws_disconnect', 1, { channel, code });
+    recordMetricEvent('ws_disconnect', { channel, code, reason }, { severity: 'warn' });
     log.warn(`${channel} WS closed (code=${code}${reason ? `, reason=${reason}` : ''})`);
 
     stopHeartbeat(channel);
@@ -305,6 +309,9 @@ async function connectMarketSocket() {
   state.marketWs = ws;
 
   ws.on('open', () => {
+    if (state.marketReconnectAttempts > 0) {
+      incrementMetric('ws_reconnect', 1, { channel: 'market', attempts: state.marketReconnectAttempts });
+    }
     state.marketReconnectAttempts = 0;
     log.info(`Connected market WS (${config.marketWsUrl})`);
 
@@ -343,6 +350,9 @@ async function connectUserSocket() {
   state.userWs = ws;
 
   ws.on('open', () => {
+    if (state.userReconnectAttempts > 0) {
+      incrementMetric('ws_reconnect', 1, { channel: 'user', attempts: state.userReconnectAttempts });
+    }
     state.userReconnectAttempts = 0;
     log.info(`Connected user WS (${config.userWsUrl})`);
 

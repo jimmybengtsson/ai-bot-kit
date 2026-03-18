@@ -53,6 +53,10 @@ function isHexAddress(v) {
   return /^0x[a-fA-F0-9]{40}$/.test(String(v || '').trim());
 }
 
+function isCronLike(v) {
+  return /^\s*\S+\s+\S+\s+\S+\s+\S+\s+\S+\s*$/.test(String(v || ''));
+}
+
 function validateSettingValue(name, value) {
   const v = String(value).trim();
   if (v === '') return null; // Empty means reset to env default.
@@ -66,8 +70,18 @@ function validateSettingValue(name, value) {
     case 'FUNDER_ADDRESS':
       return isHexAddress(v) ? null : 'Must be a valid 0x-prefixed 40-hex Ethereum address';
     case 'REALTIME_MONITORING':
-    case 'PAPER_TRADE':
+    case 'PUBLIC_READ_ENDPOINTS_ENABLED':
+    case 'AI_VALIDATOR_ENABLED':
+    case 'VOLATILITY_CONFIDENCE_ENABLED':
       return isBooleanString(v) ? null : 'Must be true or false';
+    case 'TRADING_MODE': {
+      const mode = v.toLowerCase();
+      return ['off', 'shadow', 'paper', 'live'].includes(mode)
+        ? null
+        : 'Must be one of: off, shadow, paper, live';
+    }
+    case 'OPS_API_TOKEN':
+      return v.length >= 12 ? null : 'Must be at least 12 characters when set';
     case 'MARKET_WS_URL':
     case 'USER_WS_URL':
       return isWsUrl(v) ? null : 'Must start with ws:// or wss://';
@@ -88,7 +102,57 @@ function validateSettingValue(name, value) {
     }
     case 'MAX_ACTIVE_BETS':
     case 'MAX_DAILY_BETS':
+    case 'MAX_DAILY_UNIQUE_EXPOSURES':
     case 'MAX_DAILY_TOKENS': {
+      const n = parseNumber(v, { integer: true });
+      return inRange(n, { min: 1 }) ? null : 'Must be an integer >= 1';
+    }
+    case 'MAX_EVENTS_PER_SCAN': {
+      const n = parseNumber(v, { integer: true });
+      return inRange(n, { min: 1 }) ? null : 'Must be an integer >= 1';
+    }
+    case 'SCAN_WINDOW_MIN_HOURS': {
+      const n = parseNumber(v, { integer: true });
+      return inRange(n, { min: 0 }) ? null : 'Must be an integer >= 0';
+    }
+    case 'SCAN_WINDOW_MAX_HOURS': {
+      const n = parseNumber(v, { integer: true });
+      return inRange(n, { min: 1 }) ? null : 'Must be an integer >= 1';
+    }
+    case 'SCAN_CRON':
+    case 'DAILY_REPORT_CRON':
+    case 'STALE_ORDER_CANCEL_CRON':
+    case 'STATUS_FALLBACK_CRON':
+      return isCronLike(v) ? null : 'Must be a 5-field cron expression';
+    case 'RESOLUTION_GRACE_MINUTES': {
+      const n = parseNumber(v, { integer: true });
+      return inRange(n, { min: 0 }) ? null : 'Must be an integer >= 0';
+    }
+    case 'CIRCUIT_BREAKER_FAILURE_THRESHOLD': {
+      const n = parseNumber(v, { integer: true });
+      return inRange(n, { min: 1 }) ? null : 'Must be an integer >= 1';
+    }
+    case 'CIRCUIT_BREAKER_COOLDOWN_MS': {
+      const n = parseNumber(v, { integer: true });
+      return inRange(n, { min: 30000 }) ? null : 'Must be an integer >= 30000';
+    }
+    case 'EXPECTED_FILL_STALE_MS': {
+      const n = parseNumber(v, { integer: true });
+      return inRange(n, { min: 30000 }) ? null : 'Must be an integer >= 30000';
+    }
+    case 'RECONCILIATION_TOLERANCE_SIZE': {
+      const n = parseNumber(v);
+      return inRange(n, { min: 0 }) ? null : 'Must be a number >= 0';
+    }
+    case 'RECONCILIATION_TOLERANCE_PRICE_PCT': {
+      const n = parseNumber(v);
+      return inRange(n, { min: 0, max: 1 }) ? null : 'Must be in range [0, 1]';
+    }
+    case 'EXCHANGE_REFRESH_MIN_INTERVAL_MS': {
+      const n = parseNumber(v, { integer: true });
+      return inRange(n, { min: 1000 }) ? null : 'Must be an integer >= 1000';
+    }
+    case 'STALE_PLACED_GRACE_MINUTES': {
       const n = parseNumber(v, { integer: true });
       return inRange(n, { min: 1 }) ? null : 'Must be an integer >= 1';
     }
@@ -109,9 +173,51 @@ function validateSettingValue(name, value) {
       const n = parseNumber(v);
       return inRange(n, { min: 0, max: 100 }) ? null : 'Must be in range [0, 100]';
     }
+    case 'AI_VALIDATOR_CONFIDENCE_MAX': {
+      const n = parseNumber(v);
+      return inRange(n, { min: 0, max: 100 }) ? null : 'Must be in range [0, 100]';
+    }
     case 'MIN_EDGE': {
       const n = parseNumber(v);
       return inRange(n, { min: 0, max: 1 }) ? null : 'Must be in range [0, 1]';
+    }
+    case 'AI_VALIDATOR_EDGE_MAX': {
+      const n = parseNumber(v);
+      return inRange(n, { min: 0, max: 1 }) ? null : 'Must be in range [0, 1]';
+    }
+    case 'BOUNDARY_NO_TRADE_BAND_DEG': {
+      const n = parseNumber(v);
+      return inRange(n, { min: 0, max: 5 }) ? null : 'Must be in range [0, 5]';
+    }
+    case 'BOUNDARY_OVERRIDE_CONFIDENCE': {
+      const n = parseNumber(v);
+      return inRange(n, { min: 0, max: 100 }) ? null : 'Must be in range [0, 100]';
+    }
+    case 'BOUNDARY_OVERRIDE_EDGE': {
+      const n = parseNumber(v);
+      return inRange(n, { min: 0, max: 1 }) ? null : 'Must be in range [0, 1]';
+    }
+    case 'VOLATILITY_LOW_PCT':
+    case 'VOLATILITY_HIGH_PCT': {
+      const n = parseNumber(v);
+      return inRange(n, { min: 0, max: 100 }) ? null : 'Must be in range [0, 100]';
+    }
+    case 'VOLATILITY_CONFIDENCE_BUMP_LOW':
+    case 'VOLATILITY_CONFIDENCE_BUMP_HIGH': {
+      const n = parseNumber(v);
+      return inRange(n, { min: 0, max: 30 }) ? null : 'Must be in range [0, 30]';
+    }
+    case 'LIQUIDITY_MIN_SCORE': {
+      const n = parseNumber(v);
+      return inRange(n, { min: 0, max: 100 }) ? null : 'Must be in range [0, 100]';
+    }
+    case 'LIQUIDITY_FRESH_MS': {
+      const n = parseNumber(v, { integer: true });
+      return inRange(n, { min: 1000 }) ? null : 'Must be an integer >= 1000';
+    }
+    case 'LIQUIDITY_MAX_SPREAD_PCT': {
+      const n = parseNumber(v);
+      return inRange(n, { min: 0, max: 1, minInclusive: false }) ? null : 'Must be in range (0, 1]';
     }
     case 'MAX_BET_SIZE': {
       const n = parseNumber(v);
@@ -133,10 +239,6 @@ function validateSettingValue(name, value) {
     case 'HIGH_BET_TAKE_PROFIT': {
       const n = parseNumber(v);
       return inRange(n, { min: 0, minInclusive: false }) ? null : 'Must be a number > 0 (percentage units)';
-    }
-    case 'TAKE_PROFIT_DISABLE_BEFORE_END_MINUTES': {
-      const n = parseNumber(v, { integer: true });
-      return Number.isInteger(n) ? null : 'Must be an integer (can be positive or negative)';
     }
     case 'STOP_LOSS_TCP': {
       const n = parseNumber(v);
@@ -181,6 +283,21 @@ export function validatePublicSettings(values = {}) {
     fieldErrors.push({
       name: 'MIN_ODDS_VALUE',
       message: 'Must be <= MAX_ODDS_VALUE after applying all changes',
+    });
+  }
+
+  const scanMinCurrent = effectiveValueFor('SCAN_WINDOW_MIN_HOURS');
+  const scanMaxCurrent = effectiveValueFor('SCAN_WINDOW_MAX_HOURS');
+  const scanMinEnv = envDefaultFor('SCAN_WINDOW_MIN_HOURS');
+  const scanMaxEnv = envDefaultFor('SCAN_WINDOW_MAX_HOURS');
+  const scanMinEffective = computeEffectiveWithIncoming('SCAN_WINDOW_MIN_HOURS', incomingMap.SCAN_WINDOW_MIN_HOURS, scanMinCurrent, scanMinEnv);
+  const scanMaxEffective = computeEffectiveWithIncoming('SCAN_WINDOW_MAX_HOURS', incomingMap.SCAN_WINDOW_MAX_HOURS, scanMaxCurrent, scanMaxEnv);
+  const scanMinNum = parseNumber(scanMinEffective, { integer: true });
+  const scanMaxNum = parseNumber(scanMaxEffective, { integer: true });
+  if (scanMinNum != null && scanMaxNum != null && scanMinNum > scanMaxNum) {
+    fieldErrors.push({
+      name: 'SCAN_WINDOW_MIN_HOURS',
+      message: 'Must be <= SCAN_WINDOW_MAX_HOURS after applying all changes',
     });
   }
 
@@ -303,7 +420,7 @@ function ensureInitialized() {
 
   if (!watcherInitialized) {
     watcherInitialized = true;
-    fs.watchFile(SETTINGS_FILE, { interval: 1500 }, () => {
+    fs.watchFile(SETTINGS_FILE, { interval: 1500, persistent: false }, () => {
       readOverridesFromDisk();
     });
   }
@@ -334,11 +451,6 @@ export function initSettingsStore() {
 
 export function getSettingsFilePath() {
   return SETTINGS_FILE;
-}
-
-export function getSettingsMetadata() {
-  ensureInitialized();
-  return metadata.map((m) => ({ ...m }));
 }
 
 export function getPublicSettingsView() {

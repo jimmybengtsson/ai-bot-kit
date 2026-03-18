@@ -182,7 +182,19 @@ function mapExternalPositionToBet(position) {
   if (!looksWeatherText(combinedText)) return null;
 
   const category = inferWeatherCategory(combinedText);
-  const placedAt = toSqliteDateTime();
+  const sourceOpenedAt = (
+    position?.opened_at
+    || position?.open_time
+    || position?.created_at
+    || position?.createdAt
+    || position?.time
+    || position?.timestamp
+    || null
+  );
+  const sourceOpenedMs = toDateMs(sourceOpenedAt);
+  const placedAt = Number.isFinite(sourceOpenedMs)
+    ? toSqliteDateTime(new Date(sourceOpenedMs).toISOString())
+    : toSqliteDateTime();
   const marketClosed = safeBool(position?.closed ?? position?.is_closed ?? position?.market_closed);
 
   return {
@@ -217,6 +229,7 @@ function mapExternalPositionToBet(position) {
     ai_edge: null,
     sell_attempts: 0,
     placed_at: placedAt,
+    source_opened_at: sourceOpenedAt,
     resolved_at: null,
     created_at: placedAt,
   };
@@ -232,6 +245,32 @@ function normalizeOrderTokenId(order) {
 
 function normalizeOrderMarketId(order) {
   return String(order?.market || order?.market_id || order?.marketId || order?.condition_id || '').trim();
+}
+
+function normalizeOrderSide(order) {
+  return String(order?.side || order?.order_side || '').trim().toUpperCase();
+}
+
+function toDateKey(value) {
+  const ms = toDateMs(value);
+  if (!Number.isFinite(ms)) return null;
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+function normalizeEventId(value) {
+  const id = String(value || '').trim();
+  return id || null;
+}
+
+function normalizeOrderCreatedAt(order) {
+  return (
+    order?.created_at
+    || order?.createdAt
+    || order?.timestamp
+    || order?.time
+    || order?.placed_at
+    || null
+  );
 }
 
 function needsTitleBackfill(row) {
@@ -365,7 +404,7 @@ function reconcileLocalBetsAgainstExchange() {
 
     if (bet.status === 'placed') {
       const placedAtMs = toDateMs(bet.placed_at);
-      if (placedAtMs && (Date.now() - placedAtMs) < 15 * 60_000) {
+      if (placedAtMs && (Date.now() - placedAtMs) < (config.stalePlacedGraceMinutes * 60_000)) {
         continue;
       }
     }
@@ -380,7 +419,7 @@ function reconcileLocalBetsAgainstExchange() {
 
 export async function refreshExchangeState({ force = false, includeTrades = false } = {}) {
   const now = Date.now();
-  if (!force && (now - state.refresh.lastAt) < 12_000) return;
+  if (!force && (now - state.refresh.lastAt) < config.exchangeRefreshMinIntervalMs) return;
   if (state.refresh.inFlight) {
     await state.refresh.inFlight;
     return;
@@ -523,6 +562,108 @@ export function getActiveBets() {
 export function getActiveBetCount() {
   const active = getActiveBets();
   return active.filter((b) => betEstimatedNotional(b) > 0.01).length;
+}
+
+export function getEventExposureSnapshot({ eventId = null, eventTokenIds = [], inFlightIntents = [] } = {}) {
+  const tokenSet = new Set((Array.isArray(eventTokenIds) ? eventTokenIds : []).map((t) => String(t || '').trim()).filter(Boolean));
+  const normalizedEventId = normalizeEventId(eventId);
+  const exposures = [];
+  const seen = new Set();
+
+  const register = (kind, source, details = {}) => {
+    const tokenId = String(details?.tokenId || '').trim() || null;
+    const eventRef = normalizeEventId(details?.eventId);
+    const key = `${kind}::${source}::${eventRef || ''}::${tokenId || ''}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    exposures.push({ kind, source, eventId: eventRef, tokenId, details });
+  };
+
+  for (const bet of getActiveBets()) {
+    const betToken = String(bet?.token_id || '').trim();
+    const betEvent = normalizeEventId(bet?.event_id || bet?.market_id);
+    const sameToken = betToken && tokenSet.has(betToken);
+    const sameEvent = normalizedEventId && betEvent && betEvent === normalizedEventId;
+    if (!sameToken && !sameEvent) continue;
+    register('active_position', bet?.id ? 'local_or_external_bet' : 'external_position', {
+      eventId: betEvent,
+      tokenId: betToken,
+      status: bet?.status || 'active',
+      title: bet?.event_title || null,
+    });
+  }
+
+  for (const order of (Array.isArray(state.openOrders) ? state.openOrders : [])) {
+    const tokenId = normalizeOrderTokenId(order);
+    const marketId = normalizeEventId(normalizeOrderMarketId(order));
+    const side = normalizeOrderSide(order);
+    const sameToken = tokenId && tokenSet.has(tokenId);
+    const sameEvent = normalizedEventId && marketId && marketId === normalizedEventId;
+    if (!sameToken && !sameEvent) continue;
+    register('open_order', 'clob_open_orders', {
+      eventId: marketId,
+      tokenId,
+      side,
+      orderId: normalizeOrderId(order) || null,
+    });
+  }
+
+  for (const intent of (Array.isArray(inFlightIntents) ? inFlightIntents : [])) {
+    const tokenId = String(intent?.tokenId || '').trim();
+    const intentEventId = normalizeEventId(intent?.eventId || intent?.scope?.split('::')[0] || null);
+    const sameToken = tokenId && tokenSet.has(tokenId);
+    const sameEvent = normalizedEventId && intentEventId && intentEventId === normalizedEventId;
+    if (!sameToken && !sameEvent) continue;
+    register('in_flight_intent', 'execution_store', {
+      eventId: intentEventId,
+      tokenId,
+      key: intent?.key || null,
+      state: intent?.state || null,
+    });
+  }
+
+  return {
+    hasExposure: exposures.length > 0,
+    count: exposures.length,
+    reasons: exposures.map((e) => e.kind),
+    exposures,
+  };
+}
+
+export function getDailyUniqueExposureCount({ date = today(), inFlightIntents = [] } = {}) {
+  const targetDate = String(date || today()).slice(0, 10);
+  const unique = new Set();
+
+  for (const bet of getActiveBets()) {
+    const openedDate = toDateKey(bet?.source_opened_at || bet?.placed_at || bet?.created_at);
+    if (openedDate !== targetDate) continue;
+    const eventId = normalizeEventId(bet?.event_id || bet?.market_id);
+    const tokenId = String(bet?.token_id || '').trim();
+    if (!eventId && !tokenId) continue;
+    unique.add(`${eventId || 'unknown'}::${tokenId || 'unknown'}`);
+  }
+
+  for (const order of (Array.isArray(state.openOrders) ? state.openOrders : [])) {
+    const side = normalizeOrderSide(order);
+    if (side && side !== 'BUY') continue;
+    const orderDate = toDateKey(normalizeOrderCreatedAt(order));
+    if (orderDate !== targetDate) continue;
+    const eventId = normalizeEventId(normalizeOrderMarketId(order));
+    const tokenId = normalizeOrderTokenId(order);
+    if (!eventId && !tokenId) continue;
+    unique.add(`${eventId || 'unknown'}::${tokenId || 'unknown'}`);
+  }
+
+  for (const intent of (Array.isArray(inFlightIntents) ? inFlightIntents : [])) {
+    const intentDate = toDateKey(intent?.createdAt || intent?.updatedAt);
+    if (intentDate !== targetDate) continue;
+    const eventId = normalizeEventId(intent?.eventId || intent?.scope?.split('::')[0] || null);
+    const tokenId = String(intent?.tokenId || '').trim();
+    if (!eventId && !tokenId) continue;
+    unique.add(`${eventId || 'unknown'}::${tokenId || 'unknown'}`);
+  }
+
+  return unique.size;
 }
 
 export function getRecentBets(count = 30) {
@@ -800,6 +941,50 @@ export function formatOddsMovementForAI(eventId, outcomes) {
 
   if (lines.length === 0) return '';
   return `HISTORICAL ODDS MOVEMENT:\n${lines.join('\n')}`;
+}
+
+export function getEventVolatilitySummary(eventId, outcomes, { shortWindowMs = 60 * 60_000, mediumWindowMs = 6 * 60 * 60_000 } = {}) {
+  const eventKey = String(eventId || '').trim();
+  const rows = Array.isArray(outcomes) ? outcomes : [];
+  let maxAbsMoveShortPct = 0;
+  let maxAbsMoveMediumPct = 0;
+  let sampledOutcomes = 0;
+  const now = Date.now();
+
+  const computeMovePct = (historyRows, windowMs, currentPrice) => {
+    const recent = historyRows.filter((h) => {
+      const ts = toDateMs(h?.snapshot_at);
+      return Number.isFinite(ts) && ts >= (now - windowMs);
+    });
+    if (recent.length < 2) return null;
+    const baseline = Number(recent[0]?.price);
+    if (!Number.isFinite(baseline) || baseline <= 0 || !Number.isFinite(currentPrice) || currentPrice <= 0) return null;
+    return Math.abs((currentPrice - baseline) / baseline) * 100;
+  };
+
+  for (const outcome of rows) {
+    const outcomeName = String(outcome?.outcome || '').trim();
+    const currentPrice = Number(outcome?.price);
+    if (!eventKey || !outcomeName || !Number.isFinite(currentPrice) || currentPrice <= 0) continue;
+
+    const key = `${eventKey}::${outcomeName}`;
+    const history = state.oddsHistory.get(key) || [];
+    if (!Array.isArray(history) || history.length < 2) continue;
+
+    sampledOutcomes += 1;
+    const shortPct = computeMovePct(history, shortWindowMs, currentPrice);
+    const mediumPct = computeMovePct(history, mediumWindowMs, currentPrice);
+    if (Number.isFinite(shortPct)) maxAbsMoveShortPct = Math.max(maxAbsMoveShortPct, shortPct);
+    if (Number.isFinite(mediumPct)) maxAbsMoveMediumPct = Math.max(maxAbsMoveMediumPct, mediumPct);
+  }
+
+  return {
+    eventId: eventKey,
+    sampledOutcomes,
+    maxAbsMoveShortPct,
+    maxAbsMoveMediumPct,
+    eventVolatilityPct: Math.max(maxAbsMoveShortPct, maxAbsMoveMediumPct),
+  };
 }
 
 export function pruneOldOddsSnapshots() {

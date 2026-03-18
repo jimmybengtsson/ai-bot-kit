@@ -1,5 +1,5 @@
-// Diagnostic: test balance retrieval from Polymarket CLOB API
-// Checks CLOB balance + on-chain USDC.e balance for both EOA and FUNDER
+// src/diagnostic.js — CLI diagnostic for Polymarket balance and API credential checks
+// Verifies env wiring, on-chain balances, CLOB auth, and exchange collateral visibility.
 import 'dotenv/config';
 import { Wallet, ethers } from 'ethers';
 import { ClobClient } from '@polymarket/clob-client';

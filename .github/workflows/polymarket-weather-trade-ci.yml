@@ -1,0 +1,41 @@
+name: polymarket-weather-trade-ci
+
+on:
+  push:
+    paths:
+      - 'polymarket-weather-trade/**'
+      - '.github/workflows/polymarket-weather-trade-ci.yml'
+  pull_request:
+    paths:
+      - 'polymarket-weather-trade/**'
+      - '.github/workflows/polymarket-weather-trade-ci.yml'
+
+jobs:
+  test-and-validate:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: polymarket-weather-trade
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: polymarket-weather-trade/package-lock.json
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Syntax check
+        run: npm run check:syntax
+
+      - name: Unit tests
+        run: npm run test:unit
+
+      - name: Integration tests
+        run: npm run test:integration
